@@ -10,3 +10,18 @@ src/secrets.h
 
 # Backups / scratch
 *.bak
+src/secrets.h
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+.pio/
+.DS_Store
+*.pcap
+*.pcapng
+logs/
+artifacts/

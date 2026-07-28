@@ -1,0 +1,60 @@
+NETSHIELD MINI - PRIMEROS COMANDOS EN WINDOWS 10
+
+0. Comprueba Windows:
+   Pulsa Win + R
+   Escribe: winver
+   Debe ser Windows 10 versión 1809 o posterior.
+
+1. Abre PowerShell como usuario normal.
+
+2. Instala Codex:
+   powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
+
+3. Comprueba:
+   codex --version
+
+4. Instala Git, Python y VS Code si faltan.
+   Con winget, si está disponible:
+
+   winget install --id Git.Git -e
+   winget install --id Python.Python.3.12 -e
+   winget install --id Microsoft.VisualStudioCode -e
+
+5. Cierra y vuelve a abrir PowerShell.
+
+6. Permite ejecutar solo este script en esta sesión:
+   Set-ExecutionPolicy -Scope Process Bypass
+
+7. Desde la carpeta del starter:
+   .\scripts\bootstrap_windows.ps1
+
+8. Crea en GitHub un fork de:
+   https://github.com/M-Abozaid/esp32-c3-adblock
+
+9. Clona tu fork:
+   .\scripts\clone_upstream.ps1 -GitHubUser TU_USUARIO_GITHUB
+
+10. Copia AGENTS.md, CODEX_PROMPTS.md, PRODUCT_REQUIREMENTS.md, ROADMAP.md,
+    SECURITY.md y docs\ dentro de netshield-mini.
+
+11. Entra:
+    cd .\netshield-mini
+
+12. Abre VS Code:
+    code .
+
+13. Activa el entorno:
+    & "$env:USERPROFILE\.venvs\netshield-mini\Scripts\Activate.ps1"
+
+14. Inicia Codex:
+    codex
+
+15. Dentro de Codex:
+    /status
+    /permissions
+
+16. Pega únicamente P0 de CODEX_PROMPTS.md.
+
+NO flashees todavía.
+NO cambies el DNS del router.
+NO pongas la contraseña Wi-Fi en Git.
