@@ -52,7 +52,7 @@ Se configura desde una página local y no requiere app en cada dispositivo.
 ## Requisitos no funcionales
 
 - compatible con ESP32-C3 4 MB sin PSRAM;
-- build reproducible en Apple Silicon;
+- build reproducible en Windows 10 x64;
 - sin contraseñas en logs;
 - actualización fallida recuperable;
 - uso de RAM y flash documentado;

@@ -1,5 +1,6 @@
 # PlatformIO build output
 .pio/
+.platformio/
 .vscode/
 
 # Generated blocklist (build it with tools/build_blocklist.py)

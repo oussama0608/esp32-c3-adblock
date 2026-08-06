@@ -62,9 +62,10 @@ Printing notes:
 
 One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
 
-> ⚠️ Use a **current PlatformIO** — the VSCode PlatformIO extension's bundled core, or
-> `pip install -U platformio` in a venv. The distro/apt `platformio` package (e.g. 4.3.4) is
-> too old and fails with `AttributeError: ... 'resultcallback'` (issue #4). A one-click browser installer is on the way (hosting TBD).
+> This checkout is validated with PlatformIO Core 6.1.19. `platformio.ini` pins
+> pioarduino 55.03.37 (Arduino-ESP32 3.3.7 / ESP-IDF 5.5.2). On Windows 10 x64,
+> use Python 3.10–3.13 and keep the Core data inside the repository as described in
+> [`docs/WINDOWS_NOTES.md`](docs/WINDOWS_NOTES.md); no global install is needed.
 
 ```bash
 # 1. (optional) set WiFi creds at compile time — or skip this and use the

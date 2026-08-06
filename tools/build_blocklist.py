@@ -16,7 +16,10 @@ Usage: build_blocklist.py [out.bin] [src ...]
       https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts \\
       https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/ultimate.txt
 """
-import sys, os, math, urllib.request
+import math
+import os
+import sys
+import urllib.request
 
 HASH_BYTES = 5                          # 40-bit hashes -- must match firmware
 MASK = (1 << (HASH_BYTES * 8)) - 1
@@ -41,7 +44,7 @@ def fnv(b: bytes) -> int:
 
 def norm(d: str) -> str:
     d = d.strip().lower().lstrip('*').lstrip('.').rstrip('.')
-    return d[4:] if d.startswith('www.') else d
+    return d.removeprefix('www.')
 
 def read_source(src: str) -> str:
     if os.path.exists(src):
@@ -58,8 +61,9 @@ def main():
     for src in sources:
         try:
             data = read_source(src)
-        except Exception as e:
-            print(f'  !! skipped {src}: {e}', file=sys.stderr); continue
+        except (OSError, ValueError) as e:
+            print(f'  !! skipped {src}: {e}', file=sys.stderr)
+            continue
         for line in data.splitlines():
             line = line.split('#', 1)[0].strip()
             if not line or line[0] in '!/':
@@ -76,8 +80,7 @@ def main():
     collisions = len(hashes) - len(set(hashes))
     uniq = sorted(set(hashes))                       # one entry per distinct hash
     with open(out, 'wb') as f:
-        for h in uniq:
-            f.write(h.to_bytes(HASH_BYTES, 'little'))
+        f.writelines(h.to_bytes(HASH_BYTES, 'little') for h in uniq)
 
     n, size = len(uniq), len(uniq) * HASH_BYTES
     print(f'source domains   : {len(domains):,}')

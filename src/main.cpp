@@ -17,8 +17,12 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
-#include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
-                       // have been provisioned via the captive portal (copy secrets.example.h)
+#if __has_include("secrets.h")
+#include "secrets.h"   // Optional local WIFI_SSID / WIFI_PASS fallback.
+#else
+static constexpr const char* WIFI_SSID = "";
+static constexpr const char* WIFI_PASS = "";
+#endif
 
 // ---- config ----
 static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9

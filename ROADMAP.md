@@ -5,11 +5,11 @@ Fork, build limpio, blocklist, arquitectura, particiones y auditoría.
 Salida: `docs/UPSTREAM_AUDIT.md`.
 
 ## Fase 1 — Base de ingeniería
-Compatibilidad macOS/Linux, CI, tests del generador, versiones controladas.
+Compatibilidad nativa con Windows 10 x64, CI, tests del generador y versiones controladas.
 Salida: build reproducible.
 
 ## Fase 2 — Hardware
-Flasheo, DNS directo desde un Mac, métricas, prueba 24 h y 7 días.
+Flasheo, DNS directo desde el host Windows, métricas, prueba 24 h y 7 días.
 Salida: `docs/HARDWARE_VALIDATION.md`.
 
 ## Fase 3 — Seguridad

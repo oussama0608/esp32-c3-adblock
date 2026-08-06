@@ -1,8 +1,12 @@
 # Test Plan
 
+Estado a 2026-08-06: no existen tests automatizados. `pytest` devuelve exit 5
+con `no tests ran`; completar esta cobertura sigue pendiente y no se considera
+un resultado satisfactorio.
+
 ## Build
 - clone limpio;
-- macOS Apple Silicon;
+- Windows 10 x64;
 - blocklist desde cero;
 - tamaños dentro de límites;
 - sin credenciales.
@@ -36,7 +40,7 @@
 - allowlist.
 
 ## Hardware
-- alimentación Mac, cargador y router;
+- alimentación USB desde el host Windows, cargador y router;
 - RSSI;
 - 24 h y 7 días;
 - varios clientes;
