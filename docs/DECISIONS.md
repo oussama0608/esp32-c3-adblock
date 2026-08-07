@@ -113,3 +113,63 @@
 - Verificación: los comandos, gates y estructura YAML se validan localmente.
   El workflow no se considera aprobado por GitHub hasta su primera ejecución
   remota después de un push autorizado.
+
+## ADR-004 — Threat model y secuencia de hardening previa al piloto
+
+- Fecha: 2026-08-07
+- Estado: accepted
+- Implementación: pending; P4 solo documenta
+- Contexto: tras P1-P3 el build y las verificaciones de desarrollo son
+  reproducibles, pero el firmware mantiene administración HTTP sin identidad,
+  dos vías de firmware OTA sin autenticidad, actualización destructiva de
+  blocklist, onboarding abierto y un plano DNS sin harness/fuzz/HIL. El binario
+  físico ocupa 1.298.656 de 1.376.256 bytes (94,36 %) y deja 77.600 bytes, por lo
+  que el primer control debe reducir riesgo sin consumir el margen restante.
+- Modelo: registrar en `docs/THREAT_MODEL.md` treinta amenazas con activo,
+  atacante, superficie, escenario, impacto, probabilidad, severidad, controles,
+  corrección, test y aceptación. La baseline suma 5 CRITICAL, 20 HIGH, 5 MEDIUM
+  y 0 LOW. No se declara el firmware seguro ni apto para piloto.
+- Decisión P5.1: crear perfiles/gates y seleccionar A, retirando las dos OTA de
+  **firmware** por red: `/update` y ArduinoOTA, incluidos handlers, setup/loop y
+  UI. También se deshabilitan o regeneran los installers/manifests/binarios stale
+  desde el build autorizado. Blocklist no se incluye en A: upload exige
+  P5.2-P5.5 y fetch P5.2-P5.6; ambos permanecen fuera hasta esos gates.
+- Tamaño estimado: el mapa actual atribuye 1.956 bytes de BSS directo a
+  Update/ArduinoOTA/buffer. Retirarlos se estima en −18 a −45 KiB de flash y
+  −1,9 a −2,5 KiB de RAM estática; el ahorro dinámico no está medido. Son rangos
+  de planificación y no resultados; P5.1 debe medir dos builds limpios.
+- Perfiles: P5.1 crea y hace compilar en CI ambos perfiles. DEVELOPMENT solo
+  puede usarse en nuestra LAN aislada, sin tráfico
+  personal ni DNS de producción. PILOT es el perfil por defecto futuro, sin
+  bypass y con capacidades inseguras compiladas fuera. OTA de firmware queda
+  ausente en ambos hasta un diseño firmado y anti-downgrade separado.
+- Secuencia: P5.2 corrige validación/XSS antes de introducir credenciales; P5.3
+  añade autenticación/autorización; P5.4 métodos/CSRF/rebinding/rate limit y
+  canal admin protegido o ventana física (password sobre HTTP no basta); P5.5
+  hace recuperable la blocklist; P5.6 decide HTTPS/autenticidad/SSRF; P5.7
+  endurece portal/NVS/FS/Wi-Fi/BOOT; P5.8 DNS/UDP/heap; P5.9 solo reabre OTA con
+  firma/anti-downgrade; P5.10 cierra redacción de logs, privacidad, soak y WAN.
+- Restricción de blocklist: LittleFS tiene 1.376.256 bytes y el máximo P2 es
+  1.250.000 bytes. No caben live y staging al máximo. Incluso dos listas de
+  725.035 bytes exceden la partición antes de metadatos. Sin cambiar particiones,
+  un update que no pueda preservar last-known-good se rechaza o sigue apagado.
+- Restricción TLS: la sección de entrada del bundle CA completo, descartada hoy,
+  mide 68.987 bytes. Incorporarla íntegra consumiría aproximadamente esa cantidad
+  y dejaría en torno a 8.613 bytes antes de código extra; el delta real requiere
+  build. D usa raíz mínima/host restringido o deja fetch off, nunca HTTP/insecure.
+- Alternativas: B no se elige primero porque añade estado/credenciales sobre una
+  UI con XSS/CSRF y no autentica firmware; C y D no eliminan las cargas de código
+  arbitrario; E reduce cadenas indirectas pero no `/update` ni ArduinoOTA. No se
+  usa el slot OTA como staging de blocklist ni se cambia `partitions.csv`.
+- Consecuencias: P5.1 obliga a reflashear/restaurar manualmente por USB una imagen
+  known-good, con hash/procedencia y aprobación
+  humana, cierra los dos caminos CRITICAL de firmware por red, reduce el vector
+  remoto de imagen no auténtica y crea margen para controles posteriores. La
+  procedencia del binario USB todavía debe verificarse. DEVELOPMENT conserva
+  riesgos altos y no es un perfil de distribución. PILOT requiere cero CRITICAL
+  y HIL/fuzz/soak documentados.
+- Verificación P4: inspección estática del código, artefactos, mapa y binario;
+  build y diff checks locales. Pytest/Ruff no se pudieron repetir porque no están
+  instalados en el entorno local. No se implementó parche, no se flasheó, no se
+  abrió ningún puerto serie y no se cambió red, `partitions.csv` ni `LICENSE`.
+  La CI remota sigue condicionada a confirmación humana de ambos jobs verdes.
