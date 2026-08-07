@@ -1,0 +1,4 @@
+# Small deterministic hosts-format fixture.
+0.0.0.0 Ads.Example
+127.0.0.1 WWW.Telemetry.Example # inline comment
+0.0.0.0 Duplicate.Example

@@ -1,0 +1,12 @@
+# Every non-comment entry in this fixture is invalid.
+localhost
+bad_label.example
+-leading.example
+trailing-.example
+double..dot.example
+127.0.0.1
+2001:db8::1
+café.example
+example.com unexpected-token
+! adblock comment
+/regular-expression/

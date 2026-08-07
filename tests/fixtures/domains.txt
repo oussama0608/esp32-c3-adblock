@@ -1,0 +1,8 @@
+# Small deterministic domain-per-line fixture.
+
+Example.COM
+.edge.example.
+www.Tracker.Example
+*.Wild.Example.
+duplicate.example
+DUPLICATE.EXAMPLE.
