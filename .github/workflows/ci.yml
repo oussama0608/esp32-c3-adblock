@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUTF8: "1"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  python-quality:
+    name: Python quality
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.12"
+          architecture: x64
+
+      - name: Install quality tools
+        run: python -m pip install pytest==9.1.1 ruff==0.16.0
+
+      - name: Check repository invariants and tracked secrets
+        run: python tools/ci_checks.py repository
+
+      - name: Inspect workflow policy
+        run: python tools/ci_checks.py workflow
+
+      - name: Run pytest without real blocklist downloads
+        run: pytest -q
+
+      - name: Run Ruff
+        run: ruff check . --no-cache
+
+      - name: Check whitespace and unexpected tracked changes
+        run: |
+          git diff --check
+          git diff --exit-code
+
+  firmware-build:
+    name: Firmware build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      PLATFORMIO_CORE_DIR: ${{ github.workspace }}/.platformio
+      PLATFORMIO_SETTING_ENABLE_TELEMETRY: "No"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.12"
+          architecture: x64
+
+      - name: Install PlatformIO Core
+        run: python -m pip install platformio==6.1.19
+
+      - name: Check repository invariants and tracked secrets
+        run: python tools/ci_checks.py repository
+
+      - name: Generate deterministic fixture blocklist
+        run: >-
+          python tools/build_blocklist.py --max-bytes 1024
+          data/blocklist.bin tests/fixtures/domains.txt tests/fixtures/hosts.txt
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Enforce physical app-slot size
+        run: >-
+          python tools/ci_checks.py firmware
+          .pio/build/c3/firmware.bin
+
+      - name: Check protected files remained unchanged
+        run: |
+          git diff --check
+          git diff --exit-code -- partitions.csv LICENSE

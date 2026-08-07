@@ -69,3 +69,47 @@
 - Verificación: 47 casos pytest pasan también con Python 3.13 y Ruff no reporta
   infracciones. No se modifican `partitions.csv`, `LICENSE` ni el formato
   binario del firmware.
+
+## ADR-003 — CI mínima, reproducible y sin privilegios
+
+- Fecha: 2026-08-07
+- Estado: accepted
+- Contexto: P2 incorporó tests deterministas y recuperó un build local
+  verificable, pero cada push y pull request seguía sin gates automáticos para
+  calidad Python, firmware, tamaño físico, archivos protegidos o secretos.
+- Decisión: crear `.github/workflows/ci.yml` para pushes y pull requests a
+  `main` y `develop`, más `workflow_dispatch`, con permisos globales limitados a
+  `contents: read`. Usar dos jobs independientes en `windows-2022`, timeouts
+  explícitos y checkout sin persistir credenciales. No usar GitHub Secrets,
+  upload, monitor, artefactos, release ni deployment.
+- Supply chain: usar únicamente `actions/checkout` 6.0.2 en
+  `de0fac2e4500dabe0009e67214ff5f5447ce83dd` y `actions/setup-python` 6.2.0 en
+  `a309ff8b426b58ec0e2a45f0f869d46889d02405`. Ambos SHA se resolvieron desde
+  sus tags mediante `git ls-remote` contra los repositorios oficiales
+  `github.com/actions/checkout` y `github.com/actions/setup-python`, y se
+  comprobaron sus páginas de commit oficiales. No se usan referencias móviles.
+- Calidad: fijar Python 3.13.12, pytest 9.1.1 y Ruff 0.16.0. Ejecutar las 47
+  pruebas locales sin descargar blocklists, Ruff, comprobaciones de whitespace,
+  invariantes del repositorio e inspección estructural del workflow.
+- Firmware: fijar Python 3.13.12 y PlatformIO Core 6.1.19, mantener sin cambios
+  la plataforma pioarduino 55.03.37 de P1, ubicar `PLATFORMIO_CORE_DIR` en el
+  workspace, generar una blocklist solo desde fixtures y ejecutar `pio run`.
+  Medir el archivo `firmware.bin` real y fallar si supera cualquiera de los
+  slots app de 1.376.256 bytes, sin añadir un límite comercial distinto.
+- Integridad: fijar los blobs Git aprobados de `partitions.csv` y `LICENSE`,
+  validar los tamaños `app0` y `app1`, exigir una licencia presente y no vacía,
+  rechazar `src/secrets.h` rastreado y buscar indicadores obvios de secretos
+  únicamente en archivos de texto versionados. Los hallazgos muestran
+  categoría, ruta y línea, nunca el posible valor secreto.
+- Alternativas: se descartan tags móviles de Actions, scanners cloud o pesados,
+  caché innecesaria y publicación del firmware. No usar caché evita una tercera
+  Action y hace que la corrección dependa solo de un build limpio, a costa de
+  mayor duración y descargas repetidas del toolchain fijado.
+- Consecuencias: la preparación del runner requiere acceso a GitHub, PyPI y los
+  paquetes de compilación fijados, aunque pytest no descarga blocklists. La
+  imagen `windows-2022`, las dependencias transitivas de pip y la disponibilidad
+  externa no son inmutables. El escaneo de secretos es heurístico y Windows
+  Server 2022 no reproduce exactamente Windows 10 ni sustituye hardware real.
+- Verificación: los comandos, gates y estructura YAML se validan localmente.
+  El workflow no se considera aprobado por GitHub hasta su primera ejecución
+  remota después de un push autorizado.

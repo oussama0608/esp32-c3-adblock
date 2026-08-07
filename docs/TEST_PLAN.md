@@ -1,16 +1,71 @@
 # Test Plan
 
-Estado a 2026-08-06: P2 incorpora 47 casos `pytest` con fixtures locales,
-pequeñas y deterministas. La última ejecución terminó con `47 passed` y cero
-fallos tanto con el intérprete de pruebas disponible como con Python 3.13. Los
-tests no descargan blocklists ni acceden a Internet: `urlopen` está bloqueado
-por defecto y la única descarga simulada usa bytes locales controlados.
+Estado a 2026-08-07: P2 incorpora 47 casos `pytest` con fixtures locales,
+pequeñas y deterministas. La última ejecución de P2 terminó con `47 passed` y
+cero fallos tanto con el intérprete de pruebas disponible como con Python 3.13.
+Los tests no descargan blocklists ni acceden deliberadamente a Internet:
+`urlopen` está bloqueado por defecto y la única descarga simulada usa bytes
+locales controlados. P3 añade CI reproducible; su validación local no equivale a
+una ejecución satisfactoria en GitHub Actions.
 
 ## Build
 
-P2 no añade tests automatizados del firmware. `pio run` sigue siendo la puerta
-de verificación del build nativo de Windows; deben registrarse su código de
-salida, warnings y tamaños de RAM y flash en cada entrega.
+P3 ejecuta `pio run` automáticamente en Windows Server 2022 con el toolchain
+fijado, sin upload, monitor ni hardware. Esto complementa, pero no sustituye, el
+build nativo en Windows 10 ni las pruebas posteriores sobre la placa. Deben
+registrarse el código de salida, warnings y tamaños de RAM, flash y
+`firmware.bin` en cada entrega.
+
+## Integración continua — implementado en P3
+
+`.github/workflows/ci.yml` valida los pushes y pull requests dirigidos a `main`
+y `develop`, además de permitir ejecución manual mediante `workflow_dispatch`.
+El workflow solo concede `contents: read` al `GITHUB_TOKEN`. No usa GitHub
+Secrets, credenciales Wi-Fi, hardware, upload, monitor, caché, artefactos,
+releases ni deployment.
+
+El job `python-quality` usa Python 3.13.12 y ejecuta:
+
+- comprobación de contenido protegido e indicadores obvios de secretos en
+  archivos rastreados;
+- inspección estructural de la política del propio workflow y de los SHA de las
+  Actions;
+- `pytest -q` con las fixtures locales de P2;
+- `ruff check . --no-cache`;
+- `git diff --check` y rechazo de cambios rastreados inesperados.
+
+La fixture automática de pytest bloquea `urlopen` en el generador y la única
+descarga simulada usa bytes locales. Esto evita descargas deliberadas de
+blocklists, pero no constituye un sandbox general de red para el runner.
+
+El job `firmware-build` usa Python 3.13.12 y PlatformIO Core 6.1.19. Conserva
+exactamente la plataforma ESP32 fijada en P1, almacena `PLATFORMIO_CORE_DIR`
+dentro del workspace, genera una blocklist de 35 bytes exclusivamente desde las
+fixtures locales y ejecuta únicamente `pio run`.
+
+Después del build, CI mide `.pio/build/c3/firmware.bin` y lo compara con los
+slots `app0` y `app1` actuales de 1.376.256 bytes. Imprime bytes usados, libres y
+porcentaje, y falla si la imagen supera físicamente el slot. La medición local
+de P3 deja aproximadamente 77,6 KB libres; no se aplica todavía un límite
+comercial adicional.
+
+También se comprueba que `partitions.csv` y `LICENSE` conservan sus blobs Git
+aprobados, que ambos slots mantienen el tamaño esperado, que `LICENSE` sigue
+presente y no vacío, y que `src/secrets.h` no está versionado. La búsqueda de
+secretos cubre indicadores de alta confianza y asignaciones literales obvias,
+pero no sustituye una auditoría especializada.
+
+## Integración continua — pendiente
+
+- primera ejecución real del workflow en GitHub;
+- confirmar disponibilidad de versiones y comportamiento de las Actions en los
+  runners alojados;
+- confirmar tiempo y resultado de un build limpio sin caché;
+- decidir si los checks serán obligatorios mediante branch protection;
+- pruebas de Windows 10 real, hardware, red, DNS, panel y OTA ya enumeradas.
+
+La inspección estructural o el parseo local del YAML no acreditan que GitHub
+Actions haya aceptado ni ejecutado el workflow.
 
 ## Python — implementado en P2
 
