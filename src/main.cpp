@@ -57,6 +57,12 @@ Preferences prefs;
 DNSServer   dnsPortal;
 String      portalOpts;             // <option> list of scanned networks, built once at portal start
 
+// ESP32-C3 SuperMini HIL showed unstable Wi-Fi association at default TX power.
+// Limit TX power to 8.5 dBm for stable AP/STA operation.
+static bool applyC3RfWorkaround() {
+  return WiFi.setTxPower(WIFI_POWER_8_5dBm);
+}
+
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
   uint64_t h = 0xcbf29ce484222325ULL;
@@ -315,7 +321,19 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+  const bool staModeOk = WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  const uint32_t staStartWaitMs = millis();
+  while (staModeOk && !WiFi.STA.started() && millis() - staStartWaitMs < 1000) delay(1);
+  if (!staModeOk || !WiFi.STA.started()) {
+    Serial.println("[wifi] failed to start STA before applying the TX power limit");
+    return false;
+  }
+  if (!applyC3RfWorkaround()) {
+    Serial.println("[wifi] failed to apply the 8.5 dBm STA TX power limit");
+    return false;
+  }
+  WiFi.begin(ssid, pass);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(250); Serial.print("."); }
   Serial.println();
@@ -353,7 +371,11 @@ static void startConfigPortal() {
   for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + jesc(WiFi.SSID(i)) + "'>";
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
-  WiFi.mode(WIFI_AP); WiFi.softAP(ap);
+  WiFi.mode(WIFI_AP);
+  const bool softApOk = WiFi.softAP(ap);
+  if (softApOk && !applyC3RfWorkaround()) {
+    Serial.println("[wifi] failed to apply the 8.5 dBm AP TX power limit");
+  }
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
   web.on("/", handlePortalRoot);
