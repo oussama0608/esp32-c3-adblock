@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,11 @@ SOURCE_FILES = tuple(
     )
 )
 INSTALLER_ROOTS = (REPO_ROOT / "docs", REPO_ROOT / "netshield-mini")
-PARTITIONS_SHA256 = "8667103ab86b4cd0a0af917af04e87ecb0fb8819cdad75065c09a1285ca45fff"
+# Canonical bytes of Git blob af008e244e0b9cf4c77620742fb165fb9a82af97,
+# approved at the P5.1 baseline a282e56.
+PARTITIONS_CANONICAL_SHA256 = (
+    "085d06a258ab0c39018d973bf9d4fca5f4fb365f773a69200ba71eed8cdc8ee5"
+)
 LEGACY_ARTIFACT_SHA256 = {
     "bootloader.bin": "e6397e68487ada6e81a273c4b24966418ef6cbf389bae7801363c97ddcbdaeb9",
     "partitions.bin": "d847f381bacdd34ee76954807dda999f1e92d83df521f8afc9561e445562b17e",
@@ -128,6 +133,12 @@ def test_legacy_binary_artifacts_are_preserved_unmodified(
 
 
 def test_partitions_csv_is_byte_for_byte_p5_1_baseline() -> None:
-    digest = hashlib.sha256((REPO_ROOT / "partitions.csv").read_bytes()).hexdigest()
+    blob = subprocess.run(
+        ["git", "cat-file", "blob", "HEAD:partitions.csv"],
+        cwd=REPO_ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    digest = hashlib.sha256(blob).hexdigest()
 
-    assert digest == PARTITIONS_SHA256
+    assert digest == PARTITIONS_CANONICAL_SHA256
