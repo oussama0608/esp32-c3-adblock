@@ -31,9 +31,6 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
 <button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
-<h2>FIRMWARE &mdash; OTA UPDATE</h2>
-<form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
 </div><script>
 function fmt(n){return n.toLocaleString()}
 async function load(){let s=await(await fetch('/stats.json')).json();
@@ -52,10 +49,6 @@ ustat.textContent=s.upstat||'—';}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
 function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
-let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/update',{method:'POST',body:fd});fwmsg.textContent=r.ok?'✓ rebooting, reconnect in ~15s':'✗ '+await r.text();}
-catch(_){fwmsg.textContent='✓ rebooting, reconnect in ~15s';}};
 upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
 upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);

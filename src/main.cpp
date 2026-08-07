@@ -9,10 +9,8 @@
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
-#include <Update.h>            // firmware OTA
 #include <HTTPClient.h>        // remote blocklist fetch
 #include <WiFiClientSecure.h>  // https fetch
-#include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
@@ -163,7 +161,7 @@ static int forwardUpstream(int qlen) {
   while (millis() - t0 < 1000) { int sz = upstreamCli.parsePacket(); if (sz > 0) return upstreamCli.read(buf, sizeof(buf)); delay(1); }
   return 0;
 }
-// Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
+// Drain a whole RX burst per call (capped, so the web server still gets a turn) instead of
 // one packet per loop iteration. Returns true if any query was handled this call.
 static bool handleDns() {
   bool did = false;
@@ -304,27 +302,6 @@ static bool fetchBlocklist(String url) {
   return ok;
 }
 
-// ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
-static void handleFwUpdateDone() {
-  bool ok = !Update.hasError();
-  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
-  if (ok) { delay(300); ESP.restart(); }
-}
-static void handleFwUpload() {
-  HTTPUpload& u = web.upload();
-  if (u.status == UPLOAD_FILE_START) {
-    Serial.printf("[fw-ota] %s\n", u.filename.c_str());
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
-  } else if (u.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
-  } else if (u.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
-    else Update.printError(Serial);
-  } else if (u.status == UPLOAD_FILE_ABORTED) {
-    Update.abort(); Serial.println("[fw-ota] aborted");
-  }
-}
-
 // ---------- WiFi provisioning (captive portal) ----------
 // Try provisioned NVS creds first, then the compile-time secrets.h creds as a
 // fallback (so the maintainer's own device + source builders keep working). If
@@ -416,7 +393,6 @@ void setup() {
   web.on("/forgetwifi", []() { web.send(200, "text/plain", "cleared — rebooting into setup portal");
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
-  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
   web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
   web.on("/setupdate", []() {
     if (web.hasArg("u")) updateUrl = web.arg("u");
@@ -424,13 +400,10 @@ void setup() {
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
-  ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
-  ArduinoOTA.begin();
-  Serial.println("DNS :53 + dashboard :80 + OTA up");
+  Serial.println("DNS :53 + dashboard :80 up");
 }
 
 void loop() {
-  ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
   if (updateUrl.length()) {               // periodic remote blocklist auto-update

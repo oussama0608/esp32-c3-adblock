@@ -22,6 +22,12 @@ es 94,36 %. PlatformIO reportó además 1.254.885 bytes de flash y 53.124 bytes 
 RAM estática. P4 no cambia ninguna de esas cifras porque solo modifica
 documentación.
 
+P5.1 está implementado en el árbol local, todavía sin commit, ejecución CI
+remota ni HIL. Su build limpio mide 1.274.224 bytes físicos, deja 102.032 bytes
+en el slot y usa 51.164 bytes de RAM estática. La clasificación de severidad no
+cambia; el estado concreto de cuatro amenazas sí pasa a `MITIGATED` según la
+evidencia indicada abajo.
+
 ## Evidencia examinada
 
 - `src/main.cpp`, incluidas todas las rutas registradas en las líneas 411-425;
@@ -31,8 +37,9 @@ documentación.
   `SECURITY.md` completos;
 - mapa y binario del último build local de P3.
 
-Los 47 tests pytest existentes cubren el generador Python de blocklists. No hay
-todavía harness C++ del firmware, fuzzing del parser DNS ni pruebas HIL.
+Los 47 tests pytest de P2 cubren el generador Python de blocklists y los 17 tests
+de P5.1 añaden gates estáticos y de artefactos. No hay todavía harness C++ del
+firmware, fuzzing del parser DNS ni pruebas HIL.
 
 ## Método de clasificación
 
@@ -137,6 +144,20 @@ revisiones futuras: `OPEN`, `MITIGATED` (queda riesgo residual), `ACCEPTED`
 (aceptación humana documentada) y `CLOSED` (test y aceptación cumplidos). Una
 edición documental no cambia el estado; al cerrar o reclasificar una amenaza se
 actualizarán simultáneamente el registro, los totales y la evidencia.
+
+### Estado local tras P5.1
+
+| ID | Estado | Evidencia y riesgo residual |
+| --- | --- | --- |
+| TM-07 | MITIGATED | Ruta, handlers, librería y UI ausentes; falta 404/405 y recuperación USB en HIL. |
+| TM-09 | MITIGATED | API, dependencia, símbolos y strings ausentes; falta verificar red real en HIL. |
+| TM-26 | MITIGATED | Sin entrada de firmware por red y manifests inertes; firma/provenance USB y retirada remota siguen pendientes. |
+| TM-27 | MITIGATED | Sin canal de downgrade por red; el recovery físico aún no valida versión ni anti-rollback. |
+
+Estado agregado: **4 MITIGATED y 26 OPEN**. Las severidades de diseño siguen
+siendo **5 CRITICAL, 20 HIGH, 5 MEDIUM y 0 LOW** hasta que sus condiciones de
+aceptación completas permitan cierre o reclasificación. TM-18 y los riesgos de
+blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 
 ## Registro detallado
 
@@ -317,6 +338,8 @@ actualizarán simultáneamente el registro, los totales y la evidencia.
 ### TM-07 — Firmware arbitrario mediante `/update`
 
 - **ID:** TM-07.
+- **Estado P5.1:** `MITIGATED`; el camino desapareció de fuente y binario, pero
+  falta comprobar 404/405 y la recuperación USB en HIL autorizado.
 - **Activo afectado:** firmware, credenciales, tráfico DNS y control total del
   dispositivo.
 - **Atacante requerido:** cualquier cliente LAN; una exposición WAN agrava el
@@ -378,6 +401,8 @@ actualizarán simultáneamente el registro, los totales y la evidencia.
 ### TM-09 — ArduinoOTA sin autenticación
 
 - **ID:** TM-09.
+- **Estado P5.1:** `MITIGATED`; código, dependencia, símbolos y strings están
+  ausentes, pero no se ha escaneado ni probado todavía la placa real.
 - **Activo afectado:** firmware y control completo del dispositivo.
 - **Atacante requerido:** cliente con alcance IP a la STA.
 - **Superficie:** `ArduinoOTA.begin()` y `ArduinoOTA.handle()` en
@@ -875,6 +900,9 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-26 — Firmware OTA malicioso o no auténtico
 
 - **ID:** TM-26.
+- **Estado P5.1:** `MITIGATED`; no queda entrada de firmware por red y los
+  manifests están inertes, pero faltan procedencia/firma USB, HIL y confirmar la
+  retirada de cualquier despliegue web remoto tras un push autorizado.
 - **Activo afectado:** raíz de confianza del firmware, Wi-Fi, DNS y privacidad.
 - **Atacante requerido:** cliente LAN que use TM-07/TM-09, servidor de
   distribución comprometido o artefacto sustituido.
@@ -908,6 +936,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-27 — Downgrade de firmware
 
 - **ID:** TM-27.
+- **Estado P5.1:** `MITIGATED`; se eliminó el downgrade por red, pero USB/recovery
+  aún admite error de operador y no existe versión firmada ni anti-rollback.
 - **Activo afectado:** controles de seguridad y formato de datos persistentes.
 - **Atacante requerido:** acceso a un canal de update, imagen antigua válida o
   error de operador.
@@ -1173,7 +1203,7 @@ Mínimo antes de instalarlo a otra persona:
 | --- | --- | --- |
 | P4 (este documento) | 0 bytes de firmware | 0 bytes runtime |
 | Baseline P3 | 1.298.656/1.376.256 B; 77.600 B libres | 53.124/327.680 B estáticos |
-| P5.1 A | −18 a −45 KiB, pendiente de build comparativo | −1,9 a −2,5 KiB estáticos estimados; ahorro dinámico no medido |
+| P5.1 A medido | 1.274.224/1.376.256 B; 102.032 B libres; −24.432 B físicos y −20.734 B enlazados | 51.164/327.680 B; −1.960 B estáticos; ahorro dinámico no medido |
 | P5.2 E | +2 a +12 KiB estimados | 0 a +1 KiB estático; límites pueden reducir heap pico |
 | P5.3 B | +3 a +15 KiB estimados | +0,1 a 1 KiB estático y +1 a 5 KiB dinámico |
 | P5.5 C | +2 a +10 KiB estimados | <1 KiB si la validación es streaming; exige espacio flash de staging |
@@ -1212,6 +1242,11 @@ El primer flash solo se permite después de P5.1 y de aprobación humana explíc
 
 Aunque se cumplan, DEVELOPMENT conserva amenazas CRITICAL/HIGH documentadas y no
 se instalará a terceros.
+
+Estado actual: **NO-GO** para el primer flash de laboratorio. La validación local
+de P5.1 cumple build, tamaño y gates estáticos, pero faltan revisión humana, CI
+remota de la revisión exacta, autorización explícita y las comprobaciones HIL de
+ausencia de servicio/404 y recuperación USB. No se ha abierto ningún `COMx`.
 
 ## Criterios más estrictos para PILOT
 

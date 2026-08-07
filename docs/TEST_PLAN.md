@@ -1,12 +1,12 @@
 # Test Plan
 
 Estado a 2026-08-07: P2 incorpora 47 casos `pytest` con fixtures locales,
-pequeñas y deterministas. La última ejecución de P2 terminó con `47 passed` y
-cero fallos tanto con el intérprete de pruebas disponible como con Python 3.13.
-Los tests no descargan blocklists ni acceden deliberadamente a Internet:
-`urlopen` está bloqueado por defecto y la única descarga simulada usa bytes
-locales controlados. P3 añade CI reproducible; su validación local no equivale a
-una ejecución satisfactoria en GitHub Actions.
+pequeñas y deterministas. P5.1 añade 17 gates estáticos y de artefactos; la suite
+local actual termina con **64 passed** y cero fallos bajo Python 3.13. Los tests
+no descargan blocklists ni acceden deliberadamente a Internet: `urlopen` está
+bloqueado por defecto y la única descarga simulada usa bytes locales
+controlados. P3 añade CI reproducible; la validación local no equivale a una
+ejecución satisfactoria en GitHub Actions.
 
 ## Build
 
@@ -15,6 +15,47 @@ fijado, sin upload, monitor ni hardware. Esto complementa, pero no sustituye, el
 build nativo en Windows 10 ni las pruebas posteriores sobre la placa. Deben
 registrarse el código de salida, warnings y tamaños de RAM, flash y
 `firmware.bin` en cada entrega.
+
+## P5.1 — retirada de OTA de firmware por red
+
+Implementado localmente con 17 casos nuevos en
+`tests/test_p5_1_no_network_firmware_ota.py`:
+
+- ausencia en `src/` de `ArduinoOTA`, `Update.h`, APIs `Update`, handlers de
+  firmware, marcadores `[fw-ota]` y APIs OTA alternativas obvias;
+- ausencia de la ruta HTTP exacta `/update`, conservando como control positivo
+  `/upload`, `/fetchnow` y `/setupdate` para la blocklist;
+- ausencia del formulario, botón, JavaScript, mensajes y referencia al binario
+  de firmware en `src/page.h`;
+- el README deja de presentar la OTA de firmware, `espota` y el instalador web
+  legacy como funciones disponibles;
+- ambos installers muestran un aviso visible `legacy`, deshabilitado e inseguro,
+  no cargan scripts/herramientas ni enlazan binarios, y sus manifests tienen
+  `status: legacy-disabled` y `builds: []` sin partes instalables;
+- los diez binarios legacy se conservan con los SHA-256 auditados, sin
+  regenerarlos ni presentarlos como instalación soportada;
+- SHA-256 exacto de `partitions.csv`, complementado por los gates P3 de blob Git,
+  slots y `git diff --exit-code`.
+
+El build limpio pre-P5.1 medido en `a282e56` produjo 1.298.656 B físicos,
+53.124 B de RAM estática y SHA-256
+`7BB4BB3F06A9757492A847DA7B4CA36F9C39D6A0A3FD60EA7026EB66355A74CE`.
+El build limpio posterior produjo 1.274.224 B, 51.164 B de RAM y SHA-256
+`DEAEEE6885A8446D678FACC7141F093E3B4061F54C7DFF76CD1693AFB1401367`.
+Son 24.432 B físicos y 1.960 B de RAM menos; el slot conserva 102.032 B libres.
+
+La inspección posterior de binario, ELF y mapa no encuentra `ArduinoOTA`,
+handlers/strings de firmware OTA ni la cadena exacta `/update`. Permanece
+`/update.cfg`, que pertenece exclusivamente a la configuración de actualización
+de blocklist y no es una ruta HTTP de firmware.
+
+Pendiente antes de cerrar las amenazas asociadas:
+
+- ejecución real de la CI para la revisión P5.1, confirmada por una persona;
+- HIL autorizado que compruebe 404/405 de `/update` y ausencia de anuncio/puerto
+  ArduinoOTA;
+- smoke de regresión DNS/panel y validación física del procedimiento
+  [USB_RECOVERY_WINDOWS.md](USB_RECOVERY_WINDOWS.md).
 
 ## Integración continua — implementado en P3
 

@@ -4,15 +4,17 @@
 
 NetShield Mini está en desarrollo y **todavía no se considera seguro para un
 piloto ni para un despliegue doméstico**. No existe una versión de producción
-con soporte de seguridad. El firmware actual conserva cinco amenazas CRITICAL,
-veinte HIGH y cinco MEDIUM; el registro completo, los tests y las condiciones de
-aceptación están en [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+con soporte de seguridad. La clasificación permanece en cinco amenazas
+CRITICAL, veinte HIGH y cinco MEDIUM. Tras P5.1 local, TM-07, TM-09, TM-26 y
+TM-27 están `MITIGATED`, no `CLOSED`; las otras 26 siguen `OPEN`. El registro,
+los tests y las condiciones de aceptación están en
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
-P1 recuperó el build reproducible, P2 endureció y probó el generador host y P3
-añadió CI. Esos controles reducen errores de desarrollo, pero no corrigen las
-vulnerabilidades del dispositivo. La CI remota solo se considera válida cuando
-el humano confirma que `python-quality` y `firmware-build` están verdes para la
-revisión exacta.
+P1 recuperó el build reproducible, P2 endureció y probó el generador host, P3
+añadió CI y P5.1 ha retirado localmente las dos vías OTA de firmware por red.
+Los demás controles de seguridad del dispositivo siguen pendientes. La CI
+remota solo se considera válida cuando el humano confirma que `python-quality`
+y `firmware-build` están verdes para la revisión exacta.
 
 No se debe flashear el firmware actual a una unidad piloto ni convertirlo en DNS
 de una red real. El primer flash de laboratorio queda condicionado a P5.1, a los
@@ -29,37 +31,42 @@ gates de `docs/THREAT_MODEL.md` y a aprobación humana explícita.
 
 ## Cinco bloqueantes principales
 
-1. `/update` y ArduinoOTA aceptan firmware por red sin autorización ni firma; los
-   installers rastreados todavía apuntan a un binario anterior con esas vías.
-2. El panel y todas sus mutaciones carecen de autenticación, autorización, CSRF
-   y defensa contra DNS rebinding.
-3. Upload/fetch destruyen primero la blocklist válida, aceptan validación mínima,
+1. El panel y todas sus mutaciones carecen de autenticación, autorización, CSRF
+   y defensa contra DNS rebinding; una exposición WAN agravaría el impacto.
+2. Upload/fetch destruyen primero la blocklist válida, aceptan validación mínima,
    permiten HTTP/`setInsecure()` y exponen SSRF.
-4. Dominios y SSID no confiables llegan a JSON/HTML/JavaScript con escape
+3. Dominios y SSID no confiables llegan a JSON/HTML/JavaScript con escape
    incorrecto y permiten XSS.
-5. El parser DNS, la asociación upstream, los límites de tasa y el heap no tienen
+4. El parser DNS, la asociación upstream, los límites de tasa y el heap no tienen
    todavía tests host, fuzzing ni validación HIL.
+5. La procedencia, firma y anti-downgrade del firmware USB no están resueltos;
+   quedan binarios legacy para auditoría y la recuperación física no tiene HIL.
 
-## Decisión inmediata de hardening
+## Estado de P5.1
 
-El primer parche P5 será **P5.1: retirar las dos OTA de firmware por red**:
+P5.1 está implementado y validado localmente, pendiente de revisión, commit, CI
+remota y HIL:
 
-- eliminar `/update`, sus handlers y el formulario del panel;
-- eliminar ArduinoOTA de setup, loop y binario;
-- crear perfiles/gates fail-closed y compilar ambos en CI;
-- deshabilitar los installers/manifests stale o regenerarlos exclusivamente desde
-  el build P5.1 con hash y procedencia; fijar por contenido su tooling web;
-- conservar los slots de `partitions.csv` sin modificarlos;
-- usar únicamente recuperación/actualización USB con aprobación humana.
+- `/update`, sus handlers y el formulario/JavaScript del panel fueron retirados;
+- ArduinoOTA fue eliminado del código, dependencias enlazadas, ELF/map y binario;
+- los dos installers activos son ahora avisos estáticos, y sus manifests son
+  marcadores inertes con `builds: []`;
+- los binarios anteriores permanecen sin cambios, únicamente como artefactos
+  legacy de auditoría, y no se generó ni publicó un reemplazo;
+- `partitions.csv` y sus dos slots no cambiaron;
+- la recuperación USB está documentada en
+  [docs/USB_RECOVERY_WINDOWS.md](docs/USB_RECOVERY_WINDOWS.md), pero no probada
+  sobre hardware.
 
-La estimación es una reducción de 18–45 KiB de flash y 1,9–2,5 KiB de RAM
-estática, pendiente de un build comparativo. Las actualizaciones de blocklist no
-se consideran seguras por ello: upload permanece fuera de PILOT hasta P5.2-P5.5
-(validación, panel guard y transacción); fetch hasta P5.2-P5.6 (además TLS,
-autenticidad y defensa SSRF).
+El build limpio bajó de 1.298.656 a 1.274.224 bytes físicos (−24.432 B,
+−1,8813 % respecto a la baseline) y de 53.124 a 51.164 bytes de RAM estática
+(−1.960 B). Quedan 102.032 bytes físicos en el slot. Las actualizaciones de
+blocklist no se consideran seguras por ello: upload permanece fuera de PILOT
+hasta P5.2-P5.5; fetch hasta P5.2-P5.6, incluidos TLS, autenticidad y defensa
+SSRF.
 
 El orden completo P5.1-P5.10 y la comparación A-E están registrados en
-`docs/THREAT_MODEL.md`. No se ha implementado ninguno de esos parches en P4.
+`docs/THREAT_MODEL.md`. P5.2 y posteriores no están implementados.
 
 ## Perfiles permitidos
 

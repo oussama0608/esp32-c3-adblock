@@ -118,7 +118,7 @@
 
 - Fecha: 2026-08-07
 - Estado: accepted
-- Implementación: pending; P4 solo documenta
+- Implementación: P5.1 local completado; pendiente de commit, CI remota y HIL
 - Contexto: tras P1-P3 el build y las verificaciones de desarrollo son
   reproducibles, pero el firmware mantiene administración HTTP sin identidad,
   dos vías de firmware OTA sin autenticidad, actualización destructiva de
@@ -129,20 +129,22 @@
   atacante, superficie, escenario, impacto, probabilidad, severidad, controles,
   corrección, test y aceptación. La baseline suma 5 CRITICAL, 20 HIGH, 5 MEDIUM
   y 0 LOW. No se declara el firmware seguro ni apto para piloto.
-- Decisión P5.1: crear perfiles/gates y seleccionar A, retirando las dos OTA de
+- Decisión P5.1: seleccionar A y retirar sin feature flag las dos OTA de
   **firmware** por red: `/update` y ArduinoOTA, incluidos handlers, setup/loop y
-  UI. También se deshabilitan o regeneran los installers/manifests/binarios stale
-  desde el build autorizado. Blocklist no se incluye en A: upload exige
-  P5.2-P5.5 y fetch P5.2-P5.6; ambos permanecen fuera hasta esos gates.
-- Tamaño estimado: el mapa actual atribuye 1.956 bytes de BSS directo a
-  Update/ArduinoOTA/buffer. Retirarlos se estima en −18 a −45 KiB de flash y
-  −1,9 a −2,5 KiB de RAM estática; el ahorro dinámico no está medido. Son rangos
-  de planificación y no resultados; P5.1 debe medir dos builds limpios.
-- Perfiles: P5.1 crea y hace compilar en CI ambos perfiles. DEVELOPMENT solo
-  puede usarse en nuestra LAN aislada, sin tráfico
-  personal ni DNS de producción. PILOT es el perfil por defecto futuro, sin
-  bypass y con capacidades inseguras compiladas fuera. OTA de firmware queda
-  ausente en ambos hasta un diseño firmado y anti-downgrade separado.
+  UI. Los installers activos quedan deshabilitados y sus manifests inertes; los
+  binarios stale se conservan sin cambios solo para auditoría. Blocklist no se
+  incluye en A: upload exige P5.2-P5.5 y fetch P5.2-P5.6.
+- Tamaño medido: dos builds limpios con el mismo Core 6.1.19 y plataforma
+  55.03.37 comparan 1.298.656 B/53.124 B RAM antes con 1.274.224 B/51.164 B RAM
+  después. P5.1 ahorra 24.432 B físicos (1,8813 % de la baseline), 20.734 B de
+  flash enlazada y 1.960 B de RAM estática. El margen sube de 77.600 a 102.032 B;
+  el ahorro dinámico no se ha medido.
+- Perfiles: la retirada de OTA es incondicional en el entorno `c3`, de modo que
+  ninguna variante construida desde este código puede reactivarla por flag.
+  DEVELOPMENT solo puede usarse en nuestra LAN aislada, sin tráfico personal ni
+  DNS de producción. PILOT sigue siendo un perfil objetivo futuro y no está
+  habilitado; OTA de firmware permanecerá ausente hasta un diseño firmado y
+  anti-downgrade separado.
 - Secuencia: P5.2 corrige validación/XSS antes de introducir credenciales; P5.3
   añade autenticación/autorización; P5.4 métodos/CSRF/rebinding/rate limit y
   canal admin protegido o ventana física (password sobre HTTP no basta); P5.5
@@ -173,3 +175,10 @@
   instalados en el entorno local. No se implementó parche, no se flasheó, no se
   abrió ningún puerto serie y no se cambió red, `partitions.csv` ni `LICENSE`.
   La CI remota sigue condicionada a confirmación humana de ambos jobs verdes.
+- Verificación P5.1: 64 tests host pasan; el build limpio posterior no enlaza
+  ArduinoOTA/Update y el escaneo de binario, ELF y mapa no encuentra sus símbolos,
+  handlers ni strings de firmware OTA. La única cadena `/update...` restante es
+  `/update.cfg`, propia de blocklist. `firmware.bin` tiene SHA-256
+  `DEAEEE6885A8446D678FACC7141F093E3B4061F54C7DFF76CD1693AFB1401367`.
+  No se ejecutaron red, puerto serie, flash ni HIL; la CI de esta revisión tampoco
+  se considera ejecutada hasta confirmación humana posterior a un push autorizado.

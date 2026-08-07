@@ -48,7 +48,10 @@ El ESP32-C3 aparecerá normalmente como `COM3`, `COM4` u otro `COMx`.
 Listar con:
 
 ```powershell
-pio device list
+$repoRoot = (Resolve-Path -LiteralPath ".").Path
+$env:PLATFORMIO_CORE_DIR = Join-Path $repoRoot ".platformio"
+$pio = Join-Path $env:PLATFORMIO_CORE_DIR "core-venv\Scripts\pio.exe"
+& $pio device list
 ```
 
 PlatformIO puede detectar automáticamente el puerto si `upload_port` no está
@@ -56,20 +59,14 @@ fijado en `platformio.ini`.
 
 ## Flasheo futuro
 
-No ejecutar hasta completar las fases P0-P7:
+P5.1 retiró la actualización de firmware por red y deshabilitó los instaladores
+web legacy. El procedimiento completo y sus condiciones están en
+[USB_RECOVERY_WINDOWS.md](USB_RECOVERY_WINDOWS.md).
 
-```powershell
-pio run
-pio run --target upload
-pio run --target uploadfs
-pio device monitor --baud 115200
-```
-
-Si hay varios puertos:
-
-```powershell
-pio run --target upload --upload-port COM4
-```
+No ejecutar hasta contar con aprobación humana y cumplir sus gates:
+la guía enlazada separa build, upload de firmware, restauración destructiva de
+LittleFS y monitor serie. `uploadfs` y `device monitor` requieren decisiones y
+aprobaciones independientes; no deben ejecutarse como una secuencia automática.
 
 ## Si no aparece ningún COM
 

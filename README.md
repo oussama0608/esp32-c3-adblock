@@ -92,22 +92,23 @@ If it can't connect (or you never set `secrets.h`), it starts an open access poi
 type the password, done. To move it to a new network later: open `http://c3adblock.local/forgetwifi`,
 or hold the **BOOT** button while powering on, and the setup portal comes back.
 
-## Over-the-air updates (no more USB)
+## Blocklist updates and firmware recovery
 
-The dashboard at **http://c3adblock.local** does it all:
+The dashboard at **http://c3adblock.local** still exposes the upstream blocklist
+update features. They are not yet hardened for a pilot; see [SECURITY.md](SECURITY.md)
+before using them even on a test LAN.
 
 - **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
   on a schedule (e.g. a GitHub release asset — update it once, every device fetches it).
-- **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
-  device verifies it and reboots into the new image. Or push over WiFi from the CLI:
-  ```bash
-  pio run -t upload --upload-port c3adblock.local --upload-protocol espota
-  ```
+- **Firmware** — firmware updates over the network are disabled in P5.1. Build a
+  reviewed image locally and use the documented, approval-gated
+  [Windows 10 USB recovery procedure](docs/USB_RECOVERY_WINDOWS.md).
 
-**4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
-blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
-single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
+The existing dual-app layout remains unchanged. Its two slots are retained for
+compatibility and a possible future signed design, not as evidence that network
+firmware update or rollback is currently available. Do not change
+`partitions.csv` without a separate capacity and recovery review.
 
 ## Use it
 
@@ -137,8 +138,9 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 
 - ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
 - ✅ mDNS (`c3adblock.local`) for discovery
-- ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
-- ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer
+- ⚠️ Blocklist upload/fetch remains available for DEVELOPMENT but is not yet pilot-safe
+- 🛑 Firmware OTA over the network and the legacy browser installers are disabled in P5.1
+- ✅ Captive-portal WiFi setup (no hardcoded creds)
 - ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win
 - ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play
 
