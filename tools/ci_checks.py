@@ -15,6 +15,7 @@ APP_SLOT_BYTES = 1_376_256
 EXPECTED_GIT_BLOBS = {
     "partitions.csv": "af008e244e0b9cf4c77620742fb165fb9a82af97",
     "LICENSE": "48f037bee127a92fbbc38a98fff7737ae0f2b8f0",
+    "platformio.ini": "93675edbde6e33d082f6e9325f53aca7f1059ee2",
 }
 EXPECTED_ACTIONS = {
     "actions/checkout": "de0fac2e4500dabe0009e67214ff5f5447ce83dd",
@@ -194,7 +195,15 @@ def check_repository(root: Path = ROOT) -> None:
         raise CheckError(f"possible secrets found:\n{detail}")
     print(f"tracked secret scan: OK ({len(tracked_files)} files)")
 
-    _git(root, "diff", "--exit-code", "--", "partitions.csv", "LICENSE")
+    _git(
+        root,
+        "diff",
+        "--exit-code",
+        "--",
+        "partitions.csv",
+        "LICENSE",
+        "platformio.ini",
+    )
     print("protected working-tree files: unchanged")
 
 

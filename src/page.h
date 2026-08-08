@@ -1,59 +1,41 @@
 #pragma once
-// Dashboard HTML for the C3 AdBlocker web UI, kept in its own header so the
-// Arduino IDE preprocessor doesn't choke on the inlined markup (issue #6).
+// Dashboard assets are kept outside main.cpp so the Arduino preprocessor does
+// not have to parse the embedded markup (upstream issue #6).
 
-const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>C3 AdBlock</title><style>
-body{font:14px system-ui,sans-serif;margin:0;background:#0d1117;color:#c9d1d9}
-header{background:#161b22;padding:14px 18px;border-bottom:1px solid #30363d}
-h1{margin:0;font-size:18px}h1 span{color:#3fb950}.wrap{padding:16px;max-width:1000px;margin:auto}
-.cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;flex:1;min-width:120px}
-.card .v{font-size:22px;font-weight:600}.card .l{color:#8b949e;font-size:12px}
-table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:18px}
-th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:13px}
-th{background:#21262d;color:#8b949e}tr:hover td{background:#1c2128}
-.b{color:#f85149}.a{color:#3fb950}.tag{background:#30363d;border-radius:4px;padding:1px 6px;font-size:11px}
-button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:4px 9px;cursor:pointer}
-button:hover{background:#30363d}.ban{color:#f85149}input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px}
-h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
-</style></head><body>
-<header><h1>🛡️ C3 AdBlock <span id=host></span></h1></header><div class=wrap>
-<div class=cards id=sys></div>
-<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
-<h2>CUSTOM BLOCKED DOMAINS</h2>
-<div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
-<table id=cl><tbody></tbody></table>
-<h2>BLOCKLIST &mdash; UPLOAD</h2>
-<form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
-<h2>BLOCKLIST &mdash; REMOTE AUTO-UPDATE</h2>
-<div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
-<button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
-</div><script>
-function fmt(n){return n.toLocaleString()}
-async function load(){let s=await(await fetch('/stats.json')).json();
-host.textContent='@ '+s.ip;
-sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
-.map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
-ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
-<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch('/ban?ip=${c.ip}').then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
-if(document.activeElement!=uurl)uurl.value=s.upurl||'';
-if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';}
-function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
-function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
-upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
-let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/upload',{method:'POST',body:fd});upmsg.textContent=r.ok?'✓ updated':'✗ '+await r.text();}
-catch(_){upmsg.textContent='✗ upload failed';}
-blf.value='';setTimeout(load,600);};
+const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetShield Mini</title><style>
+body{font:14px system-ui,sans-serif;margin:0;background:#0d1117;color:#c9d1d9}header{background:#161b22;padding:14px 18px;border-bottom:1px solid #30363d}h1{display:inline;margin:0;font-size:18px}h1 span{color:#3fb950}.actions{float:right}.wrap{padding:16px;max-width:1000px;margin:auto}.cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;flex:1;min-width:120px}.card .v{font-size:22px;font-weight:600}.card .l,.hint,#msg{color:#8b949e;font-size:12px}table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:18px}th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:13px}th{background:#21262d;color:#8b949e}tr:hover td{background:#1c2128}.b,.ban{color:#f85149}.a{color:#3fb950}.tag{background:#30363d;border-radius:4px;padding:1px 6px;font-size:11px;margin-left:4px}button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:5px 9px;cursor:pointer}button:hover{background:#30363d}button:disabled{opacity:.55;cursor:default}input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px}h2{font-size:14px;color:#8b949e;margin:18px 0 8px}.row{margin-bottom:8px}.right{text-align:right}.danger{color:#f85149}.hint{margin-bottom:18px}#msg{min-height:18px;margin-top:8px}
+</style><script src="/app.js" defer></script></head><body>
+<header><h1>NetShield Mini <span id="host"></span></h1><div class="actions"><button id="forget" class="danger" type="button">Olvidar Wi-Fi</button> <button id="logout" type="button">Cerrar sesi&oacute;n</button></div></header><main class="wrap">
+<div class="cards" id="sys"></div><div id="msg" role="status"></div>
+<h2>CLIENTES</h2><table id="ct"><thead><tr><th>Cliente</th><th>MAC</th><th>Bloqueadas</th><th>Permitidas</th><th></th></tr></thead><tbody></tbody></table>
+<h2>DOMINIOS BLOQUEADOS PERSONALIZADOS</h2><div class="row"><input id="dom" placeholder="ads.example.com" size="30"><button id="add" type="button">Bloquear dominio</button></div><table id="cl"><tbody></tbody></table>
+<h2>BLOCKLIST &mdash; CARGA</h2><form id="upf" class="row"><input type="file" id="blf" accept=".bin"><button type="submit">Subir blocklist</button> <span id="upmsg" class="hint"></span></form><div class="hint">Genera <code>blocklist.bin</code> con <code>tools/build_blocklist.py</code> y s&uacute;belo aqu&iacute;.</div>
+<h2>BLOCKLIST &mdash; ACTUALIZACI&Oacute;N REMOTA</h2><div class="row"><input id="uurl" placeholder="https://host/blocklist.bin" size="40"> cada <input id="uiv" size="2" value="24"> h <button id="save" type="button">Guardar</button> <button id="fetch" type="button">Actualizar ahora</button></div><div class="hint">&Uacute;ltima actualizaci&oacute;n: <span id="ustat">&mdash;</span></div>
+</main></body></html>)HTML";
+
+const char APP_JS[] PROGMEM = R"JS("use strict";
+const byId=id=>document.getElementById(id),host=byId("host"),sys=byId("sys"),ct=byId("ct"),cl=byId("cl"),dom=byId("dom"),uurl=byId("uurl"),uiv=byId("uiv"),ustat=byId("ustat"),upf=byId("upf"),blf=byId("blf"),upmsg=byId("upmsg"),msg=byId("msg");
+let csrf="";
+const fmt=n=>Number(n||0).toLocaleString();
+function node(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=String(text);if(cls)e.className=cls;return e}
+function cell(row,text,cls){const e=node("td",text,cls);row.appendChild(e);return e}
+function button(text,handler,cls){const e=node("button",text,cls);e.type="button";e.addEventListener("click",handler);return e}
+function fail(text){msg.textContent=text||"Solicitud fallida"}
+async function request(path,options){const r=await fetch(path,options);if(r.status===401){location.assign("/login");throw new Error("Unauthorized")}return r}
+function csrfHeaders(){if(!csrf)throw new Error("Sesi\u00f3n no disponible");return{"X-CSRF-Token":csrf}}
+async function post(path,fields){const headers=csrfHeaders(),options={method:"POST",headers};if(fields){headers["Content-Type"]="application/x-www-form-urlencoded;charset=UTF-8";options.body=new URLSearchParams(fields).toString()}const r=await request(path,options);if(!r.ok)throw new Error((await r.text())||("HTTP "+r.status));return r}
+async function action(work){msg.textContent="";try{await work()}catch(e){if(e.message!=="Unauthorized")fail(e.message)}}
+function renderCards(s){const values=[["Consultas bloqueadas",fmt(s.blocked),"b"],["Consultas permitidas",fmt(s.allowed),"a"],["Blocklist",fmt(s.domains)+" dominios",""],["Clientes",Array.isArray(s.clients)?s.clients.length:0,""],["Wi-Fi",String(s.rssi)+" dBm",""],["Temperatura",String(s.temp)+" C",""],["RAM libre",Math.round(Number(s.heap||0)/1024)+" KB",""],["Tiempo activo",s.uptime||"-",""]];const cards=values.map(v=>{const c=node("div",undefined,"card");c.append(node("div",v[1],"v "+v[2]),node("div",v[0],"l"));return c});sys.replaceChildren(...cards)}
+function renderClients(items){const rows=[...(Array.isArray(items)?items:[])].sort((a,b)=>(Number(b.blocked)+Number(b.allowed))-(Number(a.blocked)+Number(a.allowed))).map(c=>{const row=node("tr"),ip=cell(row,c.ip||"");if(c.banned)ip.appendChild(node("span","BLOQUEADO","tag danger"));cell(row,c.mac||"");cell(row,fmt(c.blocked),"b");cell(row,fmt(c.allowed),"a");const controls=cell(row,undefined,"right");controls.appendChild(button(c.banned?"Permitir":"Bloquear",()=>action(async()=>{await post("/ban",{ip:String(c.ip||"")});await load()}),"ban"));return row});ct.tBodies[0].replaceChildren(...rows)}
+function renderCustom(items){const rows=(Array.isArray(items)?items:[]).map(value=>{const d=String(value),row=node("tr");cell(row,d);const controls=cell(row,undefined,"right");controls.appendChild(button("Eliminar",()=>action(async()=>{await post("/unblock",{d});await load()})));return row});if(!rows.length){const row=node("tr");cell(row,"Ninguno","hint");rows.push(row)}cl.tBodies[0].replaceChildren(...rows)}
+async function load(){try{const r=await request("/stats.json");if(!r.ok)throw new Error("Estad\u00edsticas no disponibles");const s=await r.json();if(typeof s.csrf!=="string"||!s.csrf)throw new Error("Token CSRF ausente");csrf=s.csrf;host.textContent="@ "+String(s.ip||"");renderCards(s);renderClients(s.clients);renderCustom(s.custom);if(document.activeElement!==uurl)uurl.value=typeof s.upurl==="string"?s.upurl:"";if(document.activeElement!==uiv)uiv.value=String(s.upiv||24);ustat.textContent=s.upstat||"-";msg.textContent=""}catch(e){if(e.message!=="Unauthorized")fail(e.message)}}
+byId("add").addEventListener("click",()=>action(async()=>{const d=dom.value.trim();if(!d)return;await post("/addblock",{d});dom.value="";await load()}));
+dom.addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();byId("add").click()}});
+byId("save").addEventListener("click",()=>action(async()=>{await post("/setupdate",{u:uurl.value.trim(),h:String(parseInt(uiv.value,10)||24)});await load()}));
+byId("fetch").addEventListener("click",()=>action(async()=>{ustat.textContent="Actualizando...";const r=await post("/fetchnow");ustat.textContent=await r.text();await load()}));
+upf.addEventListener("submit",e=>{e.preventDefault();action(async()=>{const f=blf.files[0];if(!f)return;upmsg.textContent="Subiendo "+(f.size/1048576).toFixed(2)+" MB...";const fd=new FormData();fd.append("f",f);const r=await request("/upload",{method:"POST",headers:csrfHeaders(),body:fd});if(!r.ok)throw new Error((await r.text())||("HTTP "+r.status));upmsg.textContent="Actualizada";blf.value="";await load()})});
+byId("forget").addEventListener("click",()=>{if(confirm("\u00bfOlvidar las credenciales Wi-Fi guardadas y reiniciar el aprovisionamiento?"))action(async()=>{await post("/forgetwifi");msg.textContent="Credenciales Wi-Fi eliminadas"})});
+byId("logout").addEventListener("click",()=>action(async()=>{await post("/logout");location.assign("/login")}));
 load();setInterval(load,3000);
-</script></body></html>)HTML";
+)JS";

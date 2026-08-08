@@ -109,10 +109,10 @@ como `RST`.
 Si la placa no tiene un botón `RESET` accesible, desconéctela, mantenga `BOOT`,
 conéctela de nuevo y suelte `BOOT` cuando aparezca el puerto.
 
-GPIO9 también es un pin de arranque. Este gesto selecciona el downloader ROM y
-no debe confundirse con el borrado Wi-Fi implementado actualmente por el
-firmware. Ese borrado físico todavía requiere validación HIL y hardening en una
-fase posterior.
+GPIO9 también es un pin de arranque. Este gesto selecciona exclusivamente el
+downloader ROM y no ejecuta la aplicación ni autoriza provisioning P5.2a. La
+recuperación Wi-Fi/admin de la aplicación se inicia solo con el firmware ya en
+ejecución: nunca use esta secuencia BOOT+RESET para ese fin.
 
 ## Flashear por USB
 

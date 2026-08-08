@@ -111,14 +111,16 @@
   externa no son inmutables. El escaneo de secretos es heurístico y Windows
   Server 2022 no reproduce exactamente Windows 10 ni sustituye hardware real.
 - Verificación: los comandos, gates y estructura YAML se validan localmente.
-  El workflow no se considera aprobado por GitHub hasta su primera ejecución
-  remota después de un push autorizado.
+  El workflow no se considera aprobado para una revisión hasta que una persona
+  confirme su ejecución remota. Para `dce4672`, esa confirmación existe y los
+  jobs `python-quality` y `firmware-build` quedaron verdes.
 
 ## ADR-004 — Threat model y secuencia de hardening previa al piloto
 
 - Fecha: 2026-08-07
 - Estado: accepted
-- Implementación: P5.1 local completado; pendiente de commit, CI remota y HIL
+- Implementación: P5.1 committed en `dce4672`; CI verde confirmada por una
+  persona y HIL funcional end-to-end completado
 - Contexto: tras P1-P3 el build y las verificaciones de desarrollo son
   reproducibles, pero el firmware mantiene administración HTTP sin identidad,
   dos vías de firmware OTA sin autenticidad, actualización destructiva de
@@ -174,11 +176,144 @@
   build y diff checks locales. Pytest/Ruff no se pudieron repetir porque no están
   instalados en el entorno local. No se implementó parche, no se flasheó, no se
   abrió ningún puerto serie y no se cambió red, `partitions.csv` ni `LICENSE`.
-  La CI remota sigue condicionada a confirmación humana de ambos jobs verdes.
-- Verificación P5.1: 64 tests host pasan; el build limpio posterior no enlaza
+  En esa revisión P4, la CI remota seguía condicionada a confirmación humana; la
+  confirmación posterior de `dce4672` se registra en la verificación P5.1.
+- Verificación P5.1: la baseline limpia anterior a P5.2 tiene 67 tests host; el
+  build de `dce4672` no enlaza
   ArduinoOTA/Update y el escaneo de binario, ELF y mapa no encuentra sus símbolos,
   handlers ni strings de firmware OTA. La única cadena `/update...` restante es
-  `/update.cfg`, propia de blocklist. `firmware.bin` tiene SHA-256
-  `DEAEEE6885A8446D678FACC7141F093E3B4061F54C7DFF76CD1693AFB1401367`.
-  No se ejecutaron red, puerto serie, flash ni HIL; la CI de esta revisión tampoco
-  se considera ejecutada hasta confirmación humana posterior a un push autorizado.
+  `/update.cfg`, propia de blocklist. La clean candidate mide 1.274.960 B
+  físicos y tiene SHA-256
+  `BA22CE059C06CD86FBBFA5D1411261C85533DB22F92C4A555E83235F5637FA9E`.
+  Una persona confirmó ambos jobs de CI verdes. El HIL end-to-end validó SoftAP,
+  DHCP, portal, persistencia, STA, panel y DNS, y justificó limitar a 8,5 dBm la
+  placa SuperMini ensayada. Eso no cierra los riesgos posteriores ni generaliza
+  el workaround RF a todos los ESP32-C3.
+
+## ADR-005 — Seguridad del panel administrativo local
+
+- Fecha: 2026-08-08
+- Estado: accepted
+- Contexto: P5.1 eliminó las vías de firmware OTA por red y liberó margen, pero
+  el dashboard y sus mutaciones seguían sin identidad, sesión, CSRF, allowlist de
+  `Host` ni codificación por contexto. ADR-004 separaba esos controles entre
+  P5.2, P5.3 y P5.4. La entrega P5.2 autorizada los combina para evitar añadir
+  primero una credencial sobre una UI que todavía pudiera ejecutar contenido no
+  confiable. Esta decisión sustituye esa secuencia para la entrega actual, sin
+  reescribir la decisión histórica de ADR-004 ni adelantar el hardening de
+  blocklist, TLS/SSRF, filesystem o DNS.
+- Verificador: usar únicamente mbedTLS ya incluido por ESP-IDF, con
+  PBKDF2-HMAC-SHA-256, 50.000 iteraciones, salt aleatorio de 16 bytes y
+  verificador de 32 bytes. Aceptar contraseñas de 12 a 128 bytes, sin valor por
+  defecto. NVS, en el namespace `admin`, guarda solo versión, iteraciones, salt y
+  verificador. Las comparaciones usan una primitiva constant-time y los buffers
+  sensibles se limpian después de usarlos.
+- Bootstrap y recuperación: crear o sustituir el verificador únicamente dentro
+  de una ventana de provisioning autorizada manteniendo BOOT tres segundos con
+  el portal y el firmware ya en ejecución. Una pulsación de cinco segundos en
+  modo STA borra Wi-Fi, verificador y sesión, espera a que BOOT se libere y
+  reinicia al portal bloqueado; allí sigue siendo necesario el gesto de tres
+  segundos. BOOT debe estar libre durante reset/power-on porque GPIO9 también es
+  un pin de strapping; esa secuencia ROM no es autorización de provisioning. La
+  ausencia o corrupción del registro falla cerrada: no crea una credencial
+  conocida ni permite administración anónima. No existe reset remoto de la
+  contraseña. El AP cautivo de esa ventana continúa abierto y sobre HTTP por
+  compatibilidad con el onboarding actual; es un riesgo DEVELOPMENT explícito y
+  un bloqueo de PILOT.
+- Sesión: mantener una sola sesión administrativa de 30 minutos. Token de sesión
+  y token CSRF independientes, de 32 bytes cada uno, se generan mediante el RNG
+  del ESP y permanecen solo en RAM. Un login correcto reemplaza la sesión
+  anterior; logout, expiración y reboot la invalidan. La cookie se limita con
+  `HttpOnly`, `SameSite=Strict`, `Path=/` y `Max-Age=1800`. No se usa `Secure`
+  mientras el dispositivo sea HTTP-only, porque el navegador no la devolvería;
+  esta omisión no aporta confidencialidad y permanece como riesgo abierto.
+- Throttle: los dos primeros fallos no añaden bloqueo; el tercero bloquea cinco
+  segundos, el cuarto diez, el quinto veinte y los siguientes treinta. El estado
+  vive solo en RAM y un login correcto o un reboot lo restablecen, evitando un
+  lockout persistente.
+- Autorización y CSRF: en modo STA solo `GET /login` y `POST /login` son públicos.
+  `GET /`, `GET /app.js` y `GET /stats.json` exigen sesión. `POST /logout`,
+  `/ban`, `/addblock`, `/unblock`, `/forgetwifi`, `/upload`, `/fetchnow` y
+  `/setupdate` exigen además un token CSRF ligado a la sesión. Las mutaciones no
+  se registran con GET. El portal es un plano separado: su formulario solo se
+  sirve en modo provisioning y `/wifisave` exige POST, autorización física y su
+  token aleatorio propio. `/update` de firmware permanece ausente.
+- Rebinding: antes del login y de cualquier contenido administrativo se acepta
+  únicamente la IPv4 STA actual o `c3adblock.local`, opcionalmente con `:80`.
+  Hosts vacíos, malformados, con controles, otro puerto o cualquier nombre
+  arbitrario reciben 403. No se construyen redirects desde el valor de `Host`.
+  El comportamiento catch-all del portal se mantiene separado porque los probes
+  cautivos usan hosts ajenos; su capacidad de mutación queda limitada por la
+  presencia física y el token de provisioning.
+- XSS y headers: codificar `&`, `<`, `>`, `"` y `'` en contextos HTML y aplicar
+  escape JSON completo para controles, comillas y backslash. El dashboard crea
+  nodos con APIs DOM seguras y listeners, sin insertar valores no confiables como
+  HTML o JavaScript. Servir el script como recurso propio y añadir
+  `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer` y una CSP con scripts solo `self`, sin objetos,
+  bases ni frames. `style-src 'unsafe-inline'` se conserva por el CSS existente;
+  no se añade HSTS a un servicio HTTP.
+- Logs y entrada: la raíz no autenticada redirige únicamente a la ruta fija
+  `/login` después de validar `Host`. El build falla si Arduino core se compila
+  en nivel `VERBOSE`, ya que `WebServer` contiene trazas que pueden imprimir los
+  cuerpos POST con contraseñas Wi-Fi/admin; los valores tampoco se imprimen desde
+  el firmware de aplicación.
+- Blocklist remota: proteger el acceso a `/upload`, `/fetchnow` y `/setupdate` no
+  hace segura su implementación. P5.2 no corrige el reemplazo destructivo,
+  límites/atomicidad, HTTP remoto, `setInsecure()`, autenticidad, redirects ni
+  SSRF; los correspondientes gates de PILOT siguen abiertos.
+- Alternativas: se descartan contraseña hardcoded o plaintext en NVS, Basic Auth
+  en cada request, SameSite como única defensa CSRF, tokens persistidos, una
+  dependencia web/auth de terceros y un HTTPS aparente sin identidad/cadena de
+  confianza. Deshabilitar todo el panel sería más pequeño, pero no cumple el HIL
+  administrativo solicitado; sigue siendo una alternativa válida para PILOT si
+  no se puede proteger el canal.
+- Consecuencias: TM-01, TM-02, TM-16, TM-17, TM-18 y TM-19 son candidatas directas
+  a `MITIGATED`, no `CLOSED`. El access control reduce parcialmente TM-03 a
+  TM-06 y TM-08; el throttle solo cubre la parte login de TM-20; el gesto físico
+  solo reduce parte de TM-10/TM-11/TM-30. Todas conservan sus fallos semánticos o
+  controles pendientes. HTTP claro permite a un observador on-path capturar
+  contraseña/cookie y el portal físico sigue abierto: PILOT permanece **NO-GO**.
+- Verificación requerida: tests host de KDF/almacenamiento, aleatoriedad y vida de
+  sesión, flags de cookie, logout, throttle, matriz ruta/método/auth/CSRF,
+  allowlist de `Host`, escape contextual, DOM, CSP, regresión OTA/RF y archivos
+  protegidos; después, build y medición exacta. Navegador/HIL debe validar BOOT,
+  alta/reset, login, expiración/reboot, hosts y puertos, CSRF ausente/erróneo,
+  corpus XSS y regresión DNS.
+- Verificación local final: 99 tests aprobados (32 de P5.2), Ruff y diff checks
+  correctos. PlatformIO enlaza 1.249.513 B (90,8 %) y 51.292 B de RAM (15,7 %).
+  El binario físico mide 1.291.104 B, deja 85.152 B (83,16 KiB) y tiene SHA-256
+  `F87A9498C1E182A72E881C9C4BFBEE1AF2F2ACF9694A0B4352F0366278EB5463`. La CI,
+  el navegador y el HIL de esta revisión siguen pendientes; estas medidas no
+  autorizan un flash ni un piloto.
+
+### Enmienda P5.2a — autorización BOOT en runtime
+
+- Fecha: 2026-08-08.
+- Estado: accepted; validación HIL pendiente.
+- Motivo: GPIO9/BOOT es un pin de strapping del ESP32-C3. La doble lectura LOW
+  durante `setup()`, separada 60 ms, exigía una secuencia frágil tras liberar
+  reset y contradecía las instrucciones que recomendaban mantener BOOT durante
+  el arranque.
+- Decisión: `setup()` solo configura el pull-up. Dos máquinas de estado no
+  bloqueantes, armadas después de observar BOOT liberado, exigen LOW continuo
+  durante tres segundos en el portal o cinco segundos en STA. Soltar el botón o
+  un rebote a HIGH reinicia el conteo. El portal rota su CSRF y permanece activo;
+  el guardado y STA esperan una liberación estable antes de reiniciar para no
+  muestrear GPIO9 LOW como strap. STA invalida sesión/CSRF y borra
+  Wi-Fi/verificador antes de quedar pendiente del release.
+- Fallo AP: si `WiFi.softAP()` no arranca, no se inicia DNS/web ni se anuncia un
+  portal inexistente. El firmware queda detenido de forma fail-closed, cediendo
+  CPU y sin crear un bucle de reinicios.
+- Límites: el polling puede retrasarse durante operaciones sincrónicas ya
+  existentes; los clears NVS todavía no propagan su resultado; el portal abierto
+  y la autorización sin expiración siguen siendo solo DEVELOPMENT. La secuencia
+  BOOT+RESET documentada para el downloader ROM permanece separada y nunca es el
+  gesto de provisioning.
+- Verificación local: 105 tests aprobados, Ruff y diff checks correctos. El build
+  enlaza 1.250.561 B de flash y usa 51.332 B de RAM. `firmware.bin` mide
+  1.292.272 B, deja 83.984 B físicos y tiene SHA-256
+  `534B18024AF53267565C97BAB39A704614172E85C464C146066C6B28483BEEAE`.
+  Frente a P5.2 son +1.048 B enlazados, +40 B RAM y +1.168 B físicos; el margen sigue
+  por encima del gate de 64 KiB. HIL P5.2a permanece pendiente y el build no
+  autoriza flash.

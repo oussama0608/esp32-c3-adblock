@@ -87,10 +87,18 @@ pio device monitor          # -> http://c3adblock.local
 
 ### WiFi setup (no re-flash needed)
 
-If it can't connect (or you never set `secrets.h`), it starts an open access point
-**`C3-AdBlock-XXXX`** with a captive portal — join it from a phone, pick your network,
-type the password, done. To move it to a new network later: open `http://c3adblock.local/forgetwifi`,
-or hold the **BOOT** button while powering on, and the setup portal comes back.
+If it cannot connect, or if no administrator password has been created yet, it
+starts the open access point **`C3-AdBlock-XXXX`** with a captive portal. With the
+device already running, hold **BOOT** continuously for 3 seconds, release it,
+reload the portal, then choose the lab network and create the local administrator
+password. Never hold BOOT during reset or power-on for application provisioning.
+
+To recover from a forgotten administrator password while the dashboard is
+running, hold **BOOT** continuously for 5 seconds and then release it. The device
+clears Wi-Fi/admin state and restarts normally into the read-only portal; hold
+BOOT there for 3 seconds to authorize new provisioning. The authenticated
+dashboard's **Forget Wi-Fi** action provides the same portal path without treating
+`/forgetwifi` as a public GET URL.
 
 ## Blocklist updates and firmware recovery
 

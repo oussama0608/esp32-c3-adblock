@@ -2,8 +2,9 @@
 
 ## Estado y alcance
 
-- Fecha de análisis: 2026-08-07.
-- Baseline revisada: `develop` en `c1ad780`, después de P1, P2 y P3.
+- Fecha de análisis original: 2026-08-07; actualización P5.2: 2026-08-08.
+- Baseline P4 revisada: `develop` en `c1ad780`, después de P1, P2 y P3.
+- Baseline de implementación P5.2: `develop` en `dce4672`, después de P5.1.
 - Hardware objetivo: ESP32-C3 SuperMini, 4 MB flash, sin PSRAM.
 - Alcance: firmware, panel HTTP, onboarding Wi-Fi, DNS, persistencia y
   actualización. La cadena de build de P1-P3 se usa como control de desarrollo,
@@ -12,9 +13,9 @@
   cambiar la red o las particiones y habilitar un despliegue.
 
 Este documento describe el estado actual, no un estado seguro. El firmware no
-está preparado para un piloto. La ejecución remota de GitHub Actions solo podrá
-considerarse válida cuando el humano confirme que los jobs `python-quality` y
-`firmware-build` están verdes para la revisión exacta que se quiera usar.
+está preparado para un piloto. Una persona confirmó verdes los jobs
+`python-quality` y `firmware-build` de `dce4672`; esa evidencia pertenece solo a
+ese commit y no acredita la candidate P5.2 hasta ejecutar su revisión exacta.
 
 La imagen local de referencia mide 1.298.656 bytes frente a un slot app de
 1.376.256 bytes: quedan 77.600 bytes (75,78 KiB, 5,64 %) y la ocupación física
@@ -22,24 +23,33 @@ es 94,36 %. PlatformIO reportó además 1.254.885 bytes de flash y 53.124 bytes 
 RAM estática. P4 no cambia ninguna de esas cifras porque solo modifica
 documentación.
 
-P5.1 está implementado en el árbol local, todavía sin commit, ejecución CI
-remota ni HIL. Su build limpio mide 1.274.224 bytes físicos, deja 102.032 bytes
-en el slot y usa 51.164 bytes de RAM estática. La clasificación de severidad no
-cambia; el estado concreto de cuatro amenazas sí pasa a `MITIGATED` según la
-evidencia indicada abajo.
+P5.1 está committed en `dce4672`, con CI verde confirmada y HIL funcional
+end-to-end. Su clean candidate mide 1.274.960 bytes físicos, deja 101.296 bytes
+en el slot, enlaza 1.234.851 bytes y usa 51.164 bytes de RAM estática. La
+clasificación de severidad no cambia; el estado concreto de cuatro amenazas se
+mantiene `MITIGATED` según la evidencia indicada abajo.
 
 ## Evidencia examinada
 
-- `src/main.cpp`, incluidas todas las rutas registradas en las líneas 411-425;
-- `src/page.h`, incluido el JavaScript que consume JSON y construye HTML;
+- `src/main.cpp`, incluido el inventario de rutas, persistencia, red y handlers;
+- `src/page.h`, incluido el JavaScript que consume JSON y construye el DOM;
 - `platformio.ini` y `partitions.csv` solo en lectura;
 - `docs/UPSTREAM_AUDIT.md`, `docs/TEST_PLAN.md`, `docs/DECISIONS.md` y
   `SECURITY.md` completos;
 - mapa y binario del último build local de P3.
 
-Los 47 tests pytest de P2 cubren el generador Python de blocklists y los 17 tests
-de P5.1 añaden gates estáticos y de artefactos. No hay todavía harness C++ del
-firmware, fuzzing del parser DNS ni pruebas HIL.
+Las citas de líneas conservadas dentro del registro detallado identifican la
+baseline histórica P4 `c1ad780` y sus escenarios previos al control; no deben
+usarse como localizadores de la candidate P5.2. Para el código actual, el
+inventario de rutas de esta actualización y los nombres de handlers son la
+referencia. Esta distinción evita presentar `HTTP_ANY`, `innerHTML`, `jesc` u
+otras superficies históricas como si siguieran implementadas.
+
+Los 47 tests pytest de P2 cubren el generador Python de blocklists y la baseline
+completa anterior a P5.2 suma 67 resultados aprobados con los gates P5.1. P5.2
+añade 32 gates estáticos y la suite local completa termina con 99 aprobados. No
+hay todavía harness C++ del firmware, fuzzing del parser DNS ni tests de
+navegador para el panel P5.2. Sí existe HIL funcional end-to-end de `dce4672`.
 
 ## Método de clasificación
 
@@ -96,10 +106,11 @@ Flujos y límites:
 1. Los clientes envían UDP/53 al ESP32; este analiza el nombre y, si permite la
    consulta, reenvía UDP/53 a `9.9.9.9`.
 2. El navegador accede por HTTP/80 al panel y sus rutas administrativas.
-3. En onboarding, un AP abierto, DNS cautivo y HTTP reciben SSID y contraseña.
+3. En onboarding, un AP abierto, DNS cautivo y HTTP reciben SSID, password Wi-Fi
+   y el alta local del verificador administrativo dentro de la ventana física.
 4. NVS guarda credenciales; LittleFS guarda blocklist, bans, dominios y URL.
-5. La red puede entregar firmware por `/update` o ArduinoOTA, y blocklists por
-   `/upload` o `HTTPClient`.
+5. P5.1 retiró la entrega de firmware por `/update` y ArduinoOTA. Las blocklists
+   aún entran por `/upload` o `HTTPClient`, con sus riesgos propios abiertos.
 6. BOOT/GPIO9 es el límite físico de recuperación de credenciales Wi-Fi.
 
 ## Resumen del registro
@@ -145,25 +156,75 @@ revisiones futuras: `OPEN`, `MITIGATED` (queda riesgo residual), `ACCEPTED`
 edición documental no cambia el estado; al cerrar o reclasificar una amenaza se
 actualizarán simultáneamente el registro, los totales y la evidencia.
 
-### Estado local tras P5.1
+### Estado confirmado tras P5.1
 
 | ID | Estado | Evidencia y riesgo residual |
 | --- | --- | --- |
-| TM-07 | MITIGATED | Ruta, handlers, librería y UI ausentes; falta 404/405 y recuperación USB en HIL. |
-| TM-09 | MITIGATED | API, dependencia, símbolos y strings ausentes; falta verificar red real en HIL. |
+| TM-07 | MITIGATED | Ruta, handlers, librería y UI ausentes; CI verde confirmada. Falta el 404/405 explícito en HIL. |
+| TM-09 | MITIGATED | API, dependencia, símbolos y strings ausentes; CI verde confirmada. Falta el escaneo explícito del servicio en HIL. |
 | TM-26 | MITIGATED | Sin entrada de firmware por red y manifests inertes; firma/provenance USB y retirada remota siguen pendientes. |
 | TM-27 | MITIGATED | Sin canal de downgrade por red; el recovery físico aún no valida versión ni anti-rollback. |
 
-Estado agregado: **4 MITIGATED y 26 OPEN**. Las severidades de diseño siguen
+Estado agregado P5.1: **4 MITIGATED y 26 OPEN**. Las severidades de diseño siguen
 siendo **5 CRITICAL, 20 HIGH, 5 MEDIUM y 0 LOW** hasta que sus condiciones de
 aceptación completas permitan cierre o reclasificación. TM-18 y los riesgos de
 blocklist, XSS, CSRF y DNS permanecen `OPEN`.
+
+### Audit de rutas y política P5.2
+
+El portal cautivo y el servidor STA no se ejecutan simultáneamente, aunque ambos
+reutilizan `WebServer`. `HTTP_ANY` describe el registro anterior a P5.2; la
+columna final es la política de la candidate.
+
+| Ruta | Método anterior | Propósito | ¿Muta? | Entrada/salida no confiable | Protección anterior | Acción P5.2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `/` (STA) | ANY | Dashboard | No | Muestra datos obtenidos de stats | Ninguna | GET; `Host` permitido y sesión; redirect fijo a `/login` si falta sesión; headers defensivos. |
+| `/app.js` (STA) | No existía | Lógica propia del dashboard | No | Consume JSON y crea DOM | Script inline previo | GET; `Host` y sesión; recurso propio bajo CSP. |
+| `/stats.json` | ANY | Estado, clientes y configuración | No | IP/MAC, custom domains, URL/estado | Same-origin solamente | GET; `Host` y sesión; JSON contextual y `no-store`. |
+| `/ban` | ANY | Alternar ban de cliente | Sí | `ip` | Parseo de IP | POST; sesión y CSRF. La semántica toggle queda pendiente. |
+| `/addblock` | ANY | Añadir dominio personalizado | Sí | `d` persistido/reflejado | Normalización mínima | POST; sesión y CSRF; salida segura. Validación DNS completa queda pendiente. |
+| `/unblock` | ANY | Eliminar dominio personalizado | Sí | `d` | Normalización mínima | POST; sesión y CSRF; salida segura. |
+| `/forgetwifi` | ANY | Borrar Wi-Fi y reiniciar | Sí | Sin body útil | Ninguna | POST; sesión y CSRF. Presencia física adicional sigue pendiente. |
+| `/upload` | POST | Sustituir blocklist | Sí | Multipart/binario | Método y chequeo mínimo | POST; guard de sesión/CSRF también en upload y final. Swap seguro queda diferido. |
+| `/fetchnow` | ANY | Descargar blocklist ahora | Sí | URL persistida | Ninguna | POST; sesión y CSRF. TLS/SSRF/atomicidad no cambian. |
+| `/setupdate` | ANY | Guardar URL e intervalo | Sí | `u`, `h` | Mínimos de presencia/intervalo | POST; sesión y CSRF; render contextual. Validación/SSRF quedan pendientes. |
+| `/login` | No existía | Mostrar/validar acceso local | Sí al crear sesión RAM | Password | Ninguna | GET/POST; allowlist de `Host`, respuesta genérica y throttle. |
+| `/logout` | No existía | Invalidar sesión | Sí | Cookie y CSRF | Ninguna | POST; `Host`, sesión y CSRF; borra token RAM/cookie. |
+| `/` (portal) | ANY/catch-all | Mostrar onboarding | No | SSID escaneados | Ninguna | GET/catch-all solo en portal; HTML contextual y headers. |
+| `/wifisave` | POST | Guardar Wi-Fi y alta admin | Sí | SSID, passwords, token | SSID obligatorio | POST; ventana BOOT, CSRF de provisioning, longitudes y escape. |
+| `/update` | Ausente desde P5.1 | Firmware OTA | — | — | Compilado fuera | Debe permanecer ausente. |
+
+El scheduler que usa la URL persistida no es una ruta HTTP y no recibe una
+protección nueva por autenticar `/fetchnow` o `/setupdate`; sus riesgos quedan en
+TM-08, TM-13, TM-14 y TM-15.
+
+### Mapa conservador de la candidate P5.2
+
+| Amenaza | Efecto directo de la candidate | Estado conservador |
+| --- | --- | --- |
+| TM-01 | Guard central, inventario de métodos, sesión y headers. | Candidata a `MITIGATED`; HTTP claro y exposición de interfaz siguen abiertos. |
+| TM-02 | Stats exige Host/sesión y usa JSON contextual/no-store. | Candidata a `MITIGATED`; minimización de IP/MAC/URL aún no cumple el cierre. |
+| TM-16 | Escape HTML/JSON, DOM seguro, script propio y CSP. | Candidata a `MITIGATED`; falta corpus en navegador y datos legacy. |
+| TM-17 | Mutaciones POST con token CSRF ligado a sesión; token propio de portal. | Candidata a `MITIGATED`; falta matriz HTTP/browser/HIL completa. |
+| TM-18 | Verificador local, bootstrap físico, sesión, autorización y throttle. | Candidata a `MITIGATED`; el canal HTTP no protege contraseña/cookie on-path. |
+| TM-19 | Allowlist estricta de IPv4 local/`c3adblock.local` y puerto 80. | Candidata a `MITIGATED`; falta browser rebinding/HIL y restricción por interfaz. |
+| TM-03 a TM-06, TM-08 | La autorización reduce el atacante anónimo/CSRF. | `OPEN`: semántica, límites, recovery, atomicidad, TLS y SSRF no se corrigen. |
+| TM-10, TM-11, TM-30 | BOOT controla alta/reset admin y el estado falla cerrado. | `OPEN`: portal abierto/HTTP, NVS físico y recovery integral siguen pendientes. |
+| TM-20 | Throttle solo para login. | `OPEN`: no hay rate limiting general de DNS, panel, upload o fetch. |
+| Resto | Sin cambio deliberado en P5.2. | Conserva el estado previo. |
+
+No se cambia todavía el agregado formal por añadir documentación o tests
+estáticos. Después de validar la revisión exacta, las seis candidatas directas
+pueden pasar a `MITIGATED`, nunca a `CLOSED` sin browser/HIL y sin cumplir sus
+condiciones completas.
 
 ## Registro detallado
 
 ### TM-01 — Plano administrativo HTTP expuesto
 
 - **ID:** TM-01.
+- **Estado P5.2:** candidata a `MITIGATED`; todas las rutas STA tienen método y
+  guard explícitos, pero HTTP claro y los tests browser/HIL dejan riesgo residual.
 - **Activo afectado:** configuración, política de bloqueo, disponibilidad y
   privacidad administrativa.
 - **Atacante requerido:** cualquier cliente de la LAN; también un atacante WAN
@@ -177,14 +238,15 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 - **Probabilidad:** Alta en una LAN con clientes no confiables.
 - **Severidad:** HIGH; las rutas de ejecución de firmware se clasifican aparte
   como CRITICAL.
-- **Controles actuales:** el panel se inicia tras conectar en modo STA. El
-  firmware no modifica el router ni declara CORS, pero esos son hechos de
-  contexto y no aportan autenticación, autorización ni defensa CSRF.
-- **Controles ausentes:** HTTPS local, autenticación, autorización, inventario de
-  métodos, sesión, headers defensivos y restricción explícita a la LAN.
-- **Corrección propuesta:** middleware central `default deny`, separar lectura y
-  administración, compilar fuera capacidades no terminadas y añadir los
-  controles de TM-17 a TM-20 antes de habilitar escritura.
+- **Controles actuales:** P5.2 añade verificador local, sesión RAM, guards
+  separados de lectura/mutación, métodos explícitos, CSRF, allowlist de `Host` y
+  headers defensivos. El panel solo se registra tras conectar en modo STA.
+- **Controles ausentes:** confidencialidad/autenticidad del canal HTTP,
+  restricción explícita por interfaz/subred, rate limiting general y HIL de la
+  matriz completa.
+- **Corrección propuesta:** conservar el inventario fail-closed, validar toda ruta
+  nueva y resolver el canal/interfaz antes de PILOT; compilar el panel fuera si
+  no puede protegerse adecuadamente.
 - **Test necesario:** matriz automatizada de ruta por método, estado de sesión,
   perfil y origen; una ruta nueva debe fallar cerrada si no está inventariada.
 - **Condición de aceptación:** ninguna ruta administrativa devuelve datos ni
@@ -194,6 +256,8 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-02 — Exposición de `/stats.json`
 
 - **ID:** TM-02.
+- **Estado P5.2:** candidata a `MITIGATED`; Host y sesión bloquean acceso anónimo,
+  pero la respuesta autenticada aún contiene datos que deben minimizarse.
 - **Activo afectado:** IP y MAC de clientes, patrón de actividad, URL de update,
   heap, RSSI, temperatura y configuración operativa.
 - **Atacante requerido:** cliente LAN o sitio que complete DNS rebinding.
@@ -206,11 +270,11 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
   configuración útil para ataques posteriores.
 - **Probabilidad:** Alta.
 - **Severidad:** MEDIUM; escala a HIGH junto con TM-19 o secretos en URL.
-- **Controles actuales:** no se guarda historial de dominios; se usa
-  `application/json`; IP/MAC y contadores tienen formato cerrado; la política
-  same-origin dificulta una lectura cross-origin ordinaria.
-- **Controles ausentes:** autenticación, minimización, redacción de URL/MAC,
-  `Cache-Control: no-store` y escape JSON completo de caracteres de control.
+- **Controles actuales:** exige Host permitido y sesión, usa
+  `application/json`, escape JSON de caracteres de control y
+  `Cache-Control: no-store`; no se guarda historial de dominios.
+- **Controles ausentes:** minimización/redacción de URL, IP, MAC y clientes,
+  paginación/límite de respuesta y test browser de rebinding.
 - **Corrección propuesta:** proteger la ruta, devolver solo datos necesarios,
   excluir URLs completas y usar serialización JSON contextual y acotada.
 - **Test necesario:** tests de esquema, autorización, redacción, caracteres de
@@ -224,6 +288,8 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-03 — Manipulación y DoS mediante `/ban`
 
 - **ID:** TM-03.
+- **Estado P5.2:** `OPEN`; POST+sesión+CSRF reduce acceso no autorizado, no
+  corrige la semántica toggle ni la persistencia de bans.
 - **Activo afectado:** disponibilidad DNS por cliente y persistencia de bans.
 - **Atacante requerido:** cliente LAN o navegador víctima de CSRF.
 - **Superficie:** `handleBan()` en `src/main.cpp:209-212` y GET generado en
@@ -236,10 +302,11 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
   agotamiento de la tabla.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** `IPAddress.fromString()`, máximo de 96 clientes y 32
-  bans persistidos; esos topes no preservan correctamente bans no materializados.
-- **Controles ausentes:** autorización, CSRF, POST, operación idempotente,
-  validación de pertenencia a la LAN, expiración y respuesta de error fiable.
+- **Controles actuales:** P5.2 exige POST, sesión y CSRF; además existen
+  `IPAddress.fromString()`, máximo de 96 clientes y 32 bans persistidos. Esos
+  topes no preservan correctamente bans no materializados.
+- **Controles ausentes:** operación idempotente, validación de pertenencia a la
+  LAN, expiración, persistencia recuperable y respuesta de error fiable.
 - **Corrección propuesta:** POST autenticado con estado explícito `ban=true` o
   `false`, token CSRF, objetivo conocido, cuota y expiración administrable.
 - **Test necesario:** IP inválida/ajena, replay, ban cargado antes de ver al
@@ -253,6 +320,8 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-04 — Manipulación mediante `/addblock` y `/unblock`
 
 - **ID:** TM-04.
+- **Estado P5.2:** `OPEN`; access control y output encoding reducen explotación,
+  pero validación DNS y persistencia segura quedan pendientes.
 - **Activo afectado:** integridad de la política DNS y disponibilidad de dominios
   legítimos.
 - **Atacante requerido:** cliente LAN o navegador víctima de CSRF.
@@ -263,10 +332,11 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 - **Impacto:** sobrebloqueo, evasión de bloqueo y entrada para XSS almacenado.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** trim, minúsculas, eliminación de `www.`, deduplicación
-  y máximo de 200 entradas.
+- **Controles actuales:** P5.2 exige POST, sesión y CSRF y renderiza el valor como
+  texto; también aplica trim, minúsculas, eliminación de `www.`, deduplicación y
+  máximo de 200 entradas.
 - **Controles ausentes:** validación DNS LDH/longitudes, límite de request,
-  autorización, CSRF, método POST, escritura atómica y estados HTTP precisos.
+  escritura atómica y estados HTTP precisos.
 - **Corrección propuesta:** validador canónico equivalente a la política del
   generador P2, POST autenticado, tamaño acotado y persistencia segura.
 - **Test necesario:** labels de 63/64, total de 253/254, IP, Unicode, wildcard,
@@ -278,6 +348,8 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-05 — Borrado Wi-Fi mediante `/forgetwifi`
 
 - **ID:** TM-05.
+- **Estado P5.2:** `OPEN`; ya no es anónimo/GET, pero borrar Wi-Fi aún requiere
+  una política de presencia física y recovery más fuerte.
 - **Activo afectado:** credenciales Wi-Fi y disponibilidad del servicio DNS.
 - **Atacante requerido:** cliente LAN o sitio malicioso que induce una petición.
 - **Superficie:** handler HTTP_ANY de `src/main.cpp:416-417`.
@@ -287,10 +359,10 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
   del onboarding.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** solo se borra el namespace `wifi`; existe recuperación
-  física mediante BOOT.
-- **Controles ausentes:** autorización reforzada, CSRF, POST, confirmación de
-  presencia física, comprobación de `prefs.clear()` y rollback.
+- **Controles actuales:** P5.2 exige POST, sesión y CSRF; solo se borra el
+  namespace `wifi` y existe recuperación física mediante BOOT.
+- **Controles ausentes:** reautenticación/presencia física en la operación,
+  comprobación de `prefs.clear()` y rollback.
 - **Corrección propuesta:** retirar la ruta del perfil PILOT o exigir sesión
   reciente más gesto físico local; no abrir portal por una petición remota.
 - **Test necesario:** petición anónima/CSRF, error NVS, reinicio, fallback
@@ -302,6 +374,8 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-06 — Sustitución destructiva mediante `/upload`
 
 - **ID:** TM-06.
+- **Estado P5.2:** `OPEN`; el stream y su handler final quedan guardados por
+  sesión/CSRF, pero el algoritmo destructivo no cambia.
 - **Activo afectado:** blocklist, LittleFS, disponibilidad y política DNS.
 - **Atacante requerido:** cliente LAN o navegador capaz de enviar un formulario
   cross-origin.
@@ -316,11 +390,12 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
   política persistente.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** POST multipart, temporal `/blocklist.new`, rechazo de
-  archivo vacío o no múltiplo de cinco y reapertura tras terminar.
-- **Controles ausentes:** autenticación/CSRF, límite de bytes, comprobación de
-  writes/flush/rename, orden estricto, unicidad, integridad, autenticidad y
-  conservación de last-known-good.
+- **Controles actuales:** P5.2 exige sesión/CSRF antes de aceptar el upload y en
+  su finalización; también hay POST multipart, temporal `/blocklist.new`, rechazo
+  de archivo vacío o no múltiplo de cinco y reapertura tras terminar.
+- **Controles ausentes:** límite de bytes, comprobación de writes/flush/rename,
+  orden estricto, unicidad, integridad, autenticidad y conservación de
+  last-known-good.
 - **Corrección propuesta:** mantener esta capacidad compilada fuera hasta TM-13;
   después aplicar staging validado, cuota y commit recuperable sin desactivar la
   lista viva.
@@ -339,13 +414,14 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 
 - **ID:** TM-07.
 - **Estado P5.1:** `MITIGATED`; el camino desapareció de fuente y binario, pero
-  falta comprobar 404/405 y la recuperación USB en HIL autorizado.
+  falta comprobar 404/405 explícitamente y completar el recovery destructivo en
+  HIL autorizado.
 - **Activo afectado:** firmware, credenciales, tráfico DNS y control total del
   dispositivo.
 - **Atacante requerido:** cualquier cliente LAN; una exposición WAN agrava el
   alcance.
-- **Superficie:** `/update`, `handleFwUpload()` y `Update` en
-  `src/main.cpp:307-325,419`, más el formulario de `src/page.h:34-58`.
+- **Superficie:** en la baseline P4, `/update`, `handleFwUpload()`, `Update` y el
+  formulario de `src/page.h`; todos están ausentes desde P5.1.
 - **Escenario:** el atacante sube un `firmware.bin` elegido por él sin presentar
   credencial, firma ni versión autorizada. Un multipart sin fichero puede llegar
   al handler final con `Update.hasError()==false` y reiniciar; otros POST
@@ -354,12 +430,12 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
   malicioso y eliminación de controles.
 - **Probabilidad:** Alta en una LAN no totalmente confiable.
 - **Severidad:** CRITICAL.
-- **Controles actuales:** exige POST; `Update` escribe en un slot OTA y aporta
-  comprobaciones básicas de estructura/escritura. No demuestra procedencia.
-- **Controles ausentes:** autenticación, firma de artefacto, secure boot, hash
-  autenticado, tamaño previo, versión, anti-rollback y confirmación de boot.
-- **Corrección propuesta:** P5.1 debe compilar fuera la ruta, handler, librería y
-  UI. Solo se reabrirá tras un diseño separado de firmware firmado y recovery.
+- **Controles actuales:** P5.1 compila fuera ruta, handler, librería y UI; CI y
+  escaneo de artefactos lo comprueban. La actualización autorizada queda por USB.
+- **Controles ausentes:** firma/provenance del artefacto USB, secure boot, versión,
+  anti-rollback y confirmación de boot si algún día vuelve un canal remoto.
+- **Corrección propuesta:** mantener la ausencia. Solo se reabrirá tras un diseño
+  separado de firmware firmado, anti-downgrade y recovery.
 - **Test necesario:** análisis de símbolos/rutas/UI, petición 404/405 en HIL,
   POST vacío/raw/urlencoded/multipart sin fichero antes de retirarla, escaneo de
   puertos autorizado, build size y prueba posterior de recuperación USB con
@@ -371,6 +447,8 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-08 — Fetch y configuración inseguros
 
 - **ID:** TM-08.
+- **Estado P5.2:** `OPEN`; `/fetchnow` y `/setupdate` pasan a POST protegido, pero
+  ni el fetch ni el scheduler cambian su modelo de transporte/estado.
 - **Activo afectado:** blocklist, configuración persistente, disponibilidad DNS
   y heap.
 - **Atacante requerido:** cliente LAN, CSRF o servidor remoto controlado.
@@ -383,11 +461,11 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
   un origen atacante.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** URL no vacía, intervalo mínimo nominal de una hora,
-  timeout HTTP de 20 s, idle de 15 s y requisito de HTTP 200.
-- **Controles ausentes:** autorización/CSRF, longitudes y máximo de intervalo,
-  límite total, operación asíncrona, control de redirects y conservación segura
-  de la lista.
+- **Controles actuales:** P5.2 exige sesión y CSRF para configurar o disparar la
+  ruta; se mantienen URL no vacía, intervalo mínimo nominal de una hora, timeout
+  HTTP de 20 s, idle de 15 s y requisito de HTTP 200.
+- **Controles ausentes:** longitudes y máximo de intervalo, límite total,
+  operación asíncrona, control de redirects y conservación segura de la lista.
 - **Corrección propuesta:** mantener fetch remoto deshabilitado hasta completar
   TM-13, TM-14 y TM-15; usar estado acotado, fallo cerrado y configuración
   persistida atómicamente.
@@ -402,24 +480,24 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 
 - **ID:** TM-09.
 - **Estado P5.1:** `MITIGATED`; código, dependencia, símbolos y strings están
-  ausentes, pero no se ha escaneado ni probado todavía la placa real.
+  ausentes y el HIL funcional no los reintrodujo, pero falta un escaneo explícito
+  de anuncio/puerto en la placa.
 - **Activo afectado:** firmware y control completo del dispositivo.
 - **Atacante requerido:** cliente con alcance IP a la STA.
-- **Superficie:** `ArduinoOTA.begin()` y `ArduinoOTA.handle()` en
-  `src/main.cpp:427-433`.
+- **Superficie:** en la baseline P4, `ArduinoOTA.begin()` y
+  `ArduinoOTA.handle()`; ambos están ausentes desde P5.1.
 - **Escenario:** el hostname conocido `c3adblock` anuncia/acepta una actualización
   ArduinoOTA sin contraseña ni firma de firmware.
 - **Impacto:** el mismo compromiso persistente y total de TM-07 por un protocolo
   distinto que no pasa por el panel.
 - **Probabilidad:** Alta.
 - **Severidad:** CRITICAL.
-- **Controles actuales:** solo se inicia después de conectar como STA; el backend
-  Update aporta comprobaciones técnicas de transferencia/estructura, sin
-  autenticidad, autorización ni confidencialidad frente a un atacante de red.
-- **Controles ausentes:** password/hash, autenticación fuerte, firma, control de
-  versión, restricción de origen y desactivación por perfil.
-- **Corrección propuesta:** P5.1 debe eliminar `ArduinoOTA` de ambos perfiles y
-  conservar únicamente actualización física autorizada.
+- **Controles actuales:** P5.1 eliminó API, setup, loop, dependencia y backend
+  Update; análisis de fuente/ELF/map/binario y CI protegen la ausencia.
+- **Controles ausentes:** escaneo HIL específico y autenticidad/provenance del
+  único camino físico restante.
+- **Corrección propuesta:** mantener `ArduinoOTA` ausente y conservar únicamente
+  actualización física autorizada.
 - **Test necesario:** símbolos y strings ausentes en ELF/map, servicio OTA no
   anunciado ni escuchando en HIL y regresión de DNS/panel.
 - **Condición de aceptación:** no se enlaza `ArduinoOTA`, no se llama a su loop y
@@ -428,6 +506,9 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-10 — Portal cautivo abierto o activado por fallo
 
 - **ID:** TM-10.
+- **Estado P5.2a:** `OPEN`; el alta/reset administrativo y `/wifisave` exigen un
+  hold BOOT runtime de tres segundos y token de provisioning, pero el AP y el
+  transporte continúan abiertos.
 - **Activo afectado:** credenciales Wi-Fi, asociación de red y control del
   onboarding.
 - **Atacante requerido:** equipo dentro del alcance radio durante onboarding o
@@ -435,17 +516,19 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 - **Superficie:** `connectWiFi()` y `startConfigPortal()` en
   `src/main.cpp:328-389`.
 - **Escenario:** tras 20 s sin conexión, el ESP abre indefinidamente un AP sin
-  contraseña y nombre predecible; cualquier equipo cercano puede enviar un SSID
-  y password por HTTP.
+  contraseña y nombre predecible. Antes del gesto físico solo ofrece estado
+  read-only; después del hold, cualquier equipo cercano puede competir por el
+  formulario y enviar SSID/password por HTTP mientras la autorización siga viva.
 - **Impacto:** secuestro de configuración, exposición de credenciales al medio,
   DoS y conexión del dispositivo a una red atacante.
 - **Probabilidad:** Alta durante onboarding; Media en operación normal.
 - **Severidad:** HIGH.
 - **Controles actuales:** portal y panel normal no se registran simultáneamente;
-  `/wifisave` usa POST y exige SSID; BOOT ofrece recuperación física.
-- **Controles ausentes:** presencia física obligatoria, AP protegido o secreto
-  efímero, timeout, límite de intentos, cifrado de transporte, validación y
-  confirmación de asociación antes de persistir.
+  `/wifisave` usa POST, exige SSID, CSRF aleatorio y autorización física runtime;
+  release/rebote reinician el contador BOOT.
+- **Controles ausentes:** AP protegido o secreto efímero, expiración de la
+  autorización, timeout del portal, límite de intentos, cifrado de transporte,
+  validación y confirmación de asociación antes de persistir.
 - **Corrección propuesta:** portal solo en primer arranque o ventana iniciada por
   BOOT mantenido al menos tres segundos, con timeout de cinco minutos y segunda
   confirmación física antes de persistir; validar longitudes y cerrar al fallar.
@@ -460,6 +543,8 @@ blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 ### TM-11 — Credenciales y estado en NVS
 
 - **ID:** TM-11.
+- **Estado P5.2:** `OPEN`; el password admin se almacena solo como verificador
+  salted, mientras credenciales Wi-Fi y seguridad física de NVS no cambian.
 - **Activo afectado:** SSID, contraseña Wi-Fi y capacidad de borrar/restaurar la
   configuración.
 - **Atacante requerido:** acceso físico a flash, firmware ya comprometido o fallo
@@ -623,6 +708,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-16 — XSS e inyección JSON/HTML
 
 - **ID:** TM-16.
+- **Estado P5.2:** candidata a `MITIGATED`; se eliminaron sinks ejecutables
+  conocidos, pendiente de corpus browser y migración de datos legacy.
 - **Activo afectado:** sesión futura del administrador, integridad del panel,
   credenciales de onboarding y todas las acciones accesibles al origen del ESP.
 - **Atacante requerido:** cliente LAN que persista un dominio, o AP cercano con
@@ -638,13 +725,13 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
   administrativas, robo de una futura sesión y portal falso.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** algunos campos usan `textContent`; `jesc()` escapa
-  comillas dobles y backslash; IP/MAC/counters tienen formato limitado.
-- **Controles ausentes:** validación de dominio/SSID, serializador JSON completo,
-  APIs DOM seguras, escape por contexto, CSP y migración de datos persistidos.
-- **Corrección propuesta:** P5.2 antes de añadir credenciales al panel: validar en
-  entrada y construir DOM con `textContent`/atributos seguros; eliminar handlers
-  inline y añadir una CSP compatible.
+- **Controles actuales:** P5.2 separa el script, construye contenido dinámico con
+  `textContent`/nodos/listeners, aporta escape HTML para los cinco caracteres
+  críticos, escape JSON de controles y una CSP sin script inline.
+- **Controles ausentes:** validación DNS/URL completa, corpus real de navegador,
+  migración de valores legacy y eliminación de `unsafe-inline` para estilos.
+- **Corrección propuesta:** mantener encoding por contexto, añadir validadores
+  semánticos y ejecutar corpus browser sobre cada fuente persistida/reflejada.
 - **Test necesario:** tabla de payloads para JSON, texto, atributo con comilla
   simple/doble y JS; datos legacy persistidos; navegador automatizado sin red.
 - **Condición de aceptación:** todos los payloads se rechazan o aparecen como
@@ -653,6 +740,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-17 — CSRF en operaciones de estado
 
 - **ID:** TM-17.
+- **Estado P5.2:** candidata a `MITIGATED`; las mutaciones usan POST y CSRF
+  ligado a sesión, pendiente de matriz real de métodos/orígenes.
 - **Activo afectado:** toda configuración mutable, Wi-Fi, blocklist y firmware.
 - **Atacante requerido:** sitio web malicioso visitado desde un navegador con
   acceso a la LAN; no necesita leer respuestas.
@@ -667,13 +756,14 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
   necesita la condición adicional anterior.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** uploads y Wi-Fi save exigen POST; same-origin impide
-  normalmente leer respuestas; no se declara CORS permisivo.
-- **Controles ausentes:** POST para toda mutación, token CSRF, SameSite, validación
-  de Origin/Host, content type y reautenticación de operaciones destructivas.
-- **Corrección propuesta:** rutas mutantes solo POST, token ligado a sesión,
-  cookies `HttpOnly`/`SameSite=Strict` cuando proceda y deny si Origin/Host no
-  coincide; no usar GET toggles.
+- **Controles actuales:** toda mutación STA exige POST, sesión y token CSRF; la
+  cookie usa `SameSite=Strict`, Host se valida y `/wifisave` usa un token propio
+  dentro de la ventana física. No se declara CORS permisivo.
+- **Controles ausentes:** validación explícita de Origin/content type donde sea
+  útil, reautenticación/presencia física para operaciones destructivas y test de
+  todos los métodos alternativos en WebServer real.
+- **Corrección propuesta:** mantener GET sin efectos, comprobar método/sesión/
+  token antes del handler y añadir controles reforzados a borrados y swaps.
 - **Test necesario:** `<img>`, form simple, fetch no-cors, Origin ausente/ajeno,
   token repetido/expirado, POST malformados y todos los métodos alternativos por
   cada ruta HTTP_ANY.
@@ -683,24 +773,27 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-18 — Ausencia de autenticación y autorización
 
 - **ID:** TM-18.
+- **Estado P5.2:** candidata a `MITIGATED`; existe identidad local y autorización
+  central, pero HTTP claro impide considerarla cerrada o apta para PILOT.
 - **Activo afectado:** control administrativo total y credenciales futuras.
 - **Atacante requerido:** acceso a la LAN, AP cautivo o ruta WAN accidental.
-- **Superficie:** todas las rutas HTTP y ArduinoOTA; no hay llamadas a
-  `authenticate`, `Authorization` ni password OTA.
+- **Superficie:** todas las rutas HTTP administrativas. ArduinoOTA y `/update`
+  de firmware están ausentes desde P5.1.
 - **Escenario:** cualquier cliente recibe los mismos privilegios que el dueño;
   no existen roles ni separación entre diagnóstico y operaciones destructivas.
 - **Impacto:** toma completa de administración, incluida ejecución persistente de
   firmware mediante TM-07/TM-09.
 - **Probabilidad:** Alta.
 - **Severidad:** CRITICAL.
-- **Controles actuales:** pertenencia a la Wi-Fi funciona como única barrera
-  implícita; no es una identidad de administrador.
-- **Controles ausentes:** identidad provisionada, almacenamiento seguro,
-  autorización por ruta, expiración, lockout/rate limit y recuperación sin
-  bypass remoto.
-- **Corrección propuesta:** tras P5.2, P5.3 añade un guard central y credencial
-  única provisionada físicamente. Hasta entonces, el perfil PILOT compila fuera
-  la administración o la deja estrictamente read-only.
+- **Controles actuales:** P5.2 usa verificador PBKDF2 con salt en NVS, alta/reset
+  bajo BOOT, comparación constant-time, una sesión RAM de 30 minutos, guards por
+  ruta y throttle de login sin lockout persistente.
+- **Controles ausentes:** canal confidencial/autenticado, prueba de recuperación
+  física, posible reautenticación de acciones críticas y rate limiting ajeno al
+  login.
+- **Corrección propuesta:** validar el diseño en browser/HIL y proteger o retirar
+  el canal administrativo antes de PILOT; nunca presentar HTTP+password como
+  confidencial.
 - **Test necesario:** matriz anónimo/credencial errónea/correcta/expirada por
   ruta, reboot, lockout, recuperación, logs y datos legacy; comprobar que HTTP
   no se presenta como confidencial.
@@ -711,6 +804,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-19 — DNS rebinding y falta de validación de `Host`
 
 - **ID:** TM-19.
+- **Estado P5.2:** candidata a `MITIGATED`; la allowlist rechaza hosts arbitrarios,
+  pero falta un ensayo real de rebinding y restricción por interfaz.
 - **Activo afectado:** confidencialidad del panel y autoridad administrativa.
 - **Atacante requerido:** sitio/control de DNS y navegador de una persona con
   acceso a la LAN.
@@ -724,13 +819,13 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 - **Probabilidad:** Media; Private Network Access del navegador no es un control
   universal ni estable para el firmware.
 - **Severidad:** HIGH.
-- **Controles actuales:** no hay CORS explícito y mDNS facilita identificación
-  local, no autorización.
-- **Controles ausentes:** allowlist de Host, Origin, destino/interfaz, sesión y
-  protección contra rebinding.
-- **Corrección propuesta:** aceptar solo hostnames/IP esperados, verificar Origin
-  en mutaciones, restringir el plano admin a la interfaz/subred prevista y
-  combinarlo con autenticación y CSRF.
+- **Controles actuales:** P5.2 acepta solo la IPv4 STA actual o
+  `c3adblock.local`, con `:80` opcional, antes de login/datos/acciones; rechaza
+  controles, otros puertos y hosts arbitrarios, y lo combina con sesión y CSRF.
+- **Controles ausentes:** binding explícito a interfaz/subred, validación de
+  Origin como defensa adicional y secuencia browser de rebinding/PNA.
+- **Corrección propuesta:** conservar la allowlist, probarla con DNS
+  público→privado y añadir la restricción de interfaz/canal antes de PILOT.
 - **Test necesario:** secuencia DNS público→privado, Host arbitrario/IP/puerto,
   Origin `null`, navegador con y sin PNA y acceso directo legítimo.
 - **Condición de aceptación:** un Host u Origin no permitido se rechaza antes de
@@ -739,6 +834,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-20 — Ausencia de rate limiting
 
 - **ID:** TM-20.
+- **Estado P5.2:** `OPEN`; solo el login recibe throttle RAM creciente. DNS,
+  mutaciones, upload y fetch aún carecen de cuotas generales.
 - **Activo afectado:** CPU, heap, flash, DNS y disponibilidad del panel.
 - **Atacante requerido:** cliente LAN o cliente DNS configurado/comprometido.
 - **Superficie:** UDP/53, rutas HTTP, uploads y fetch inmediato.
@@ -901,13 +998,14 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 
 - **ID:** TM-26.
 - **Estado P5.1:** `MITIGATED`; no queda entrada de firmware por red y los
-  manifests están inertes, pero faltan procedencia/firma USB, HIL y confirmar la
+  manifests están inertes, pero faltan procedencia/firma USB y confirmar la
   retirada de cualquier despliegue web remoto tras un push autorizado.
 - **Activo afectado:** raíz de confianza del firmware, Wi-Fi, DNS y privacidad.
 - **Atacante requerido:** cliente LAN que use TM-07/TM-09, servidor de
   distribución comprometido o artefacto sustituido.
-- **Superficie:** ambos mecanismos Update y cualquier futura distribución del
-  `firmware.bin`, incluidos `docs/` y `netshield-mini/`.
+- **Superficie:** distribución física/futura del `firmware.bin` y los artefactos
+  legacy de auditoría en `docs/` y `netshield-mini/`; los mecanismos Update de
+  red están compilados fuera.
 - **Escenario:** una imagen estructuralmente válida se acepta sin firma de una
   clave autorizada; un hash no autenticado tampoco prueba procedencia. Los dos
   directorios rastreados publican manifests que apuntan a un firmware anterior
@@ -916,9 +1014,9 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 - **Impacto:** código persistente con todos los privilegios del dispositivo.
 - **Probabilidad:** Alta mientras las vías actuales estén activas.
 - **Severidad:** CRITICAL.
-- **Controles actuales:** build reproducible y Actions fijadas por SHA son
-  controles de desarrollo; no enlazan criptográficamente el binario recibido con
-  el dispositivo. Update hace validación básica y CI no publica firmware.
+- **Controles actuales:** build reproducible, Actions fijadas por SHA, OTA de red
+  ausente, manifests inertes y CI sin publicar firmware. Nada de ello enlaza
+  criptográficamente un binario USB recibido con el dispositivo.
 - **Controles ausentes:** firma offline, clave pública de confianza, secure boot,
   provenance de artefacto, pin/SRI o vendoring del installer, invalidación de
   binarios stale, verificación antes de marcar bootable y boot confirmation.
@@ -966,8 +1064,9 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 - **Activo afectado:** todos los activos administrativos y de red.
 - **Atacante requerido:** atacante de Internet y port-forward/DMZ/relay/VPN mal
   configurado por el entorno.
-- **Superficie:** HTTP/80, UDP/53 y servicios OTA escuchando en STA, sin
-  restricción de origen; incluir IPv4/IPv6 según el soporte efectivo del build.
+- **Superficie:** HTTP/80 y UDP/53 escuchando en STA, sin restricción por interfaz;
+  los servicios OTA de firmware están ausentes. Incluir IPv4/IPv6 según el
+  soporte efectivo del build.
 - **Escenario:** el router publica el puerto o coloca el ESP en DMZ; un atacante
   remoto usa rutas sin autenticación para tomar el dispositivo.
 - **Impacto:** ejecución remota persistente, Wi-Fi comprometida y DNS malicioso.
@@ -1022,32 +1121,42 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-30 — Recuperación física mediante BOOT
 
 - **ID:** TM-30.
+- **Estado P5.2a:** `PARTIALLY MITIGATED`; implementación host completada, HIL
+  físico pendiente.
 - **Activo afectado:** disponibilidad, credenciales Wi-Fi y capacidad de recuperar
   una unidad no conectada.
 - **Atacante requerido:** acceso físico al dispositivo; el fallo también puede
   ser accidental por rebote/strapping.
-- **Superficie:** GPIO9 en `src/main.cpp:400-406` y bootloader ROM de ESP32-C3.
-- **Escenario:** dos lecturas separadas 60 ms borran Wi-Fi sin comprobar el
-  resultado; un `secrets.h` compilado puede volver a conectar. BOOT también es un
-  pin de strapping y puede entrar en downloader en vez del firmware.
+- **Superficie:** GPIO9, la máquina runtime de `src/main.cpp` y el bootloader ROM
+  del ESP32-C3.
+- **Escenario:** una pulsación corta, rebote, botón atascado o reinicio mientras
+  GPIO9 está LOW podría borrar estado inesperadamente o entrar en el downloader.
+  Un fallo al borrar NVS puede producir una falsa expectativa de recuperación;
+  un `secrets.h` compilado sigue siendo una vía de conexión alternativa.
 - **Impacto:** DoS físico, recuperación incompleta o falsa expectativa de borrado;
   no recupera por sí solo firmware/LittleFS corruptos.
 - **Probabilidad:** Baja.
 - **Severidad:** MEDIUM.
-- **Controles actuales:** `INPUT_PULLUP`, doble lectura y borrado limitado al
-  namespace Wi-Fi; acceso físico ofrece una vía útil fuera de red.
-- **Controles ausentes:** pulsación deliberada/temporizada, feedback, comprobación
-  del clear, interacción documentada con ROM, recovery de filesystem/firmware y
-  tests en la SuperMini exacta.
-- **Corrección propuesta:** definir procedimiento físico con confirmación visible
-  y ventana limitada; no compilar credenciales en PILOT; separar reset Wi-Fi,
-  recovery FS y reflasheo USB autorizado.
-- **Test necesario:** GPIO alto, rebote, pulsación corta/larga, power-on/reset,
-  fallback secrets, NVS fallida y HIL de modo ROM/recuperación.
-- **Condición de aceptación:** una tabla de test fija `sin pulsar`, rebote,
-  `<3 s` y `>=3 s` a su estado esperado y claves borradas/conservadas; cada caso
-  pasa 20/20 power-on y 20/20 reset. El estado se confirma tras reboot y el hash
-  de una restauración USB known-good coincide con el artefacto autorizado.
+- **Controles actuales:** `INPUT_PULLUP`; ninguna lectura destructiva en `setup()`;
+  liberación observada antes de armar; hold continuo no bloqueante de 3 s en el
+  portal y 5 s en STA; HIGH/rebote reinicia el contador. STA zeroiza sesión/CSRF,
+  borra Wi-Fi/verificador y espera BOOT HIGH estable antes de reiniciar. El portal
+  rota CSRF y permanece activo; el guardado también difiere su reboot hasta HIGH
+  estable. BOOT+RESET se documenta solo para downloader ROM.
+- **Controles ausentes:** comprobación del resultado de los clears NVS, feedback
+  visible fuera de Serial, expiración de la autorización, recovery de
+  filesystem/firmware y validación física repetida en la SuperMini exacta.
+- **Corrección propuesta:** propagar fallos NVS y no afirmar recuperación si el
+  clear falla; limitar temporalmente la autorización; no compilar credenciales
+  en PILOT; mantener separados reset Wi-Fi, recovery FS y reflasheo USB autorizado.
+- **Test necesario:** GPIO alto, mantenido desde reset, rebote, pulsaciones
+  `<3 s`/`>=3 s` en portal y `<5 s`/`>=5 s` en STA, release antes del reboot,
+  refresh CSRF sin reboot, fallback secrets, NVS fallida y HIL de modo ROM.
+- **Condición de aceptación:** ningún muestreo temprano borra estado; veinte de
+  veinte pulsaciones cortas/rebotes conservan claves y veinte de veinte holds
+  válidos producen el estado esperado. STA solo reinicia después de release y
+  vuelve al portal read-only; el formulario requiere un nuevo hold de 3 s. El
+  hash de una restauración USB known-good coincide con el artefacto autorizado.
 
 ## Cinco riesgos principales
 
@@ -1112,12 +1221,17 @@ update remoto y se mitiga con reflasheo/restauración USB known-good documentado
 
 ## Prioridad de implementación
 
+ADR-004 conserva la secuencia original como decisión histórica. La petición
+P5.2 de 2026-08-08 sustituye sus tres entregas separadas P5.2-P5.4 por una sola
+candidate coherente: XSS/encoding, autenticación, sesión, métodos, CSRF, Host y
+throttle de login se introducen juntos. Esto no da por resuelto el canal HTTP ni
+el rate limiting general.
+
 | Orden | Parche | Amenazas principales | Gate |
 | --- | --- | --- | --- |
-| **P5.1** | Crear perfiles/gates y A: retirar `/update`, ArduinoOTA y UI | TM-07, TM-09, TM-26 | CI compila ambos; obligatorio antes del primer flash de laboratorio. |
-| **P5.2** | E: validadores canónicos, JSON/DOM contextual, límites y datos legacy | TM-04, TM-10, TM-16, TM-21 | Antes de introducir una credencial/sesión en el panel. |
-| **P5.3** | B: autenticación/autorización central y recovery físico | TM-01, TM-02, TM-18 | Antes de cualquier administración PILOT. |
-| **P5.4** | Métodos, CSRF, Host/Origin, rebinding, rate limit y canal admin protegido/ventana física | TM-03, TM-05, TM-17, TM-19, TM-20 | Junto con B antes de habilitar mutaciones; password sobre HTTP no basta. |
+| **P5.1** | Retirar `/update`, ArduinoOTA y UI | TM-07, TM-09, TM-26 | Committed en `dce4672`; CI verde confirmada y HIL funcional completado. |
+| **P5.2** | Panel combinado: encoding/DOM, PBKDF2, BOOT, sesión, POST+CSRF, Host, headers y throttle login | TM-01, TM-02, TM-16 a TM-20 | Host/build y después browser/HIL; HTTP claro mantiene PILOT en NO-GO. |
+| **P5.3/P5.4 originales** | Absorbidos por P5.2 para controles de código; quedan canal, interfaz, Origin/reautenticación y rate limit general | TM-01, TM-17 a TM-20, TM-28 | No se declaran completos por añadir auth sobre HTTP. |
 | **P5.5** | C: blocklist last-known-good, límites, validación y commit recuperable | TM-06, TM-12, TM-13, TM-25 | Upload sigue compilado fuera hasta pasar fault injection y capacidad real. |
 | **P5.6** | D: HTTPS verificado, autenticidad de artefacto y política SSRF | TM-08, TM-14, TM-15 | Fetch remoto sigue compilado fuera si el coste/ciclo CA no es aceptable. |
 | **P5.7** | Portal físico/temporal, NVS/FS endurecidos, reconexión y recovery probado | TM-10 a TM-12, TM-24, TM-25, TM-30 | Bloqueante de PILOT. |
@@ -1127,7 +1241,8 @@ update remoto y se mitiga con reflasheo/restauración USB known-good documentado
 
 ## Perfiles objetivo
 
-Los perfiles son requisitos de P5; aún no existen en el firmware actual.
+Los perfiles son políticas de uso y gates; todavía no constituyen variantes de
+build completas y separadas.
 
 ### DEVELOPMENT
 
@@ -1138,8 +1253,9 @@ Utilizable únicamente en nuestra LAN de pruebas:
 - sin port-forward, DMZ, relay cloud ni administración WAN; el firmware no
   cambia router, DNS, DHCP ni Wi-Fi;
 - OTA de firmware siempre compilada fuera después de P5.1;
-- upload/fetch de blocklist apagados por defecto y solo ejercitados después de
-  sus gates en pruebas deliberadas;
+- upload/fetch de blocklist solo detrás de auth/CSRF desde P5.2, URL vacía por
+  defecto y ejercitados únicamente en pruebas deliberadas; su implementación no
+  es todavía segura ni está permitida en PILOT;
 - antes de P5.10, solo SSID de laboratorio deliberadamente no sensible y URL de
   update vacía; nunca password, token, QNAME ni bypass. P5.10 elimina/redacta
   también SSID y URL antes de PILOT;
@@ -1147,8 +1263,9 @@ Utilizable únicamente en nuestra LAN de pruebas:
 - recuperación física/USB documentada. Flasheo y puerto serie siguen requiriendo
   aprobación humana independiente.
 
-Este perfil acepta temporalmente riesgos HIGH del panel solo por aislamiento y
-control de clientes. No convierte esos riesgos en seguros ni aptos para terceros.
+Este perfil acepta temporalmente HTTP claro y otros riesgos HIGH solo por
+aislamiento, presencia física y control de clientes. No los convierte en seguros
+ni aptos para terceros.
 
 ### PILOT
 
@@ -1156,8 +1273,9 @@ Mínimo antes de instalarlo a otra persona:
 
 - perfil predeterminado y fail-closed, sin bypass de desarrollo;
 - OTA de firmware compilada fuera, salvo que P5.9 completo sea aprobado;
-- administración ausente/read-only hasta P5.2-P5.4; después, autenticada,
-  autorizada, protegida de CSRF/rebinding y limitada a LAN;
+- la candidate P5.2 autentica y protege de CSRF/rebinding a nivel de aplicación,
+  pero administración permanece ausente/read-only para PILOT hasta proteger el
+  canal y pasar browser/HIL;
 - upload ausente hasta P5.2-P5.5; fetch ausente hasta P5.2-P5.6. Deshabilitar es
   una solución válida si no caben staging, CA o firma;
 - una administración sobre HTTP claro no se aprueba solo por añadir password:
@@ -1173,7 +1291,10 @@ Mínimo antes de instalarlo a otra persona:
 
 ### Host y CI, sin hardware ni Internet
 
-- mantener los 47 pytest del generador;
+- mantener los 67 resultados pytest de la baseline anterior a P5.2;
+- P5.2 añade 32 gates de KDF/NVS, bootstrap físico fail-closed, sesión/cookie,
+  CSRF, throttle, Host, matriz de rutas/métodos, escape/DOM/CSP y regresión
+  OTA/RF/archivos protegidos; la suite local completa termina con 99 aprobados;
 - añadir harness C++ nativo para validadores, parser DNS, serialización JSON y
   asociación de respuestas;
 - fuzzing reproducible del parser con ASan/UBSan en host;
@@ -1187,6 +1308,9 @@ Mínimo antes de instalarlo a otra persona:
 
 ### HIL posterior, siempre con aprobación humana
 
+- P5.2: BOOT y alta/reset admin; login, throttle, sesión/logout/expiración/reboot;
+  Host IP/mDNS/puerto/rebinding; CSRF/métodos; corpus XSS en navegador y heap de
+  PBKDF2;
 - ausencia de `/update` y servicio ArduinoOTA; regresión DNS/panel;
 - corpus DNS, upstream falso, carga, pérdida/reconexión Wi-Fi y heap mínimo;
 - onboarding hostil con SSID malicioso, timeout y presencia física;
@@ -1203,9 +1327,8 @@ Mínimo antes de instalarlo a otra persona:
 | --- | --- | --- |
 | P4 (este documento) | 0 bytes de firmware | 0 bytes runtime |
 | Baseline P3 | 1.298.656/1.376.256 B; 77.600 B libres | 53.124/327.680 B estáticos |
-| P5.1 A medido | 1.274.224/1.376.256 B; 102.032 B libres; −24.432 B físicos y −20.734 B enlazados | 51.164/327.680 B; −1.960 B estáticos; ahorro dinámico no medido |
-| P5.2 E | +2 a +12 KiB estimados | 0 a +1 KiB estático; límites pueden reducir heap pico |
-| P5.3 B | +3 a +15 KiB estimados | +0,1 a 1 KiB estático y +1 a 5 KiB dinámico |
+| P5.1 `dce4672` medido | 1.274.960/1.376.256 B; 101.296 B libres; 1.234.851 B enlazados | 51.164/327.680 B; ahorro dinámico no medido |
+| P5.2 combinado, medido localmente | 1.291.104/1.376.256 B físicos; 85.152 B (83,16 KiB) libres; 1.249.513 B enlazados | 51.292/327.680 B estáticos; pico PBKDF2 aún debe medirse en HIL |
 | P5.5 C | +2 a +10 KiB estimados | <1 KiB si la validación es streaming; exige espacio flash de staging |
 | P5.6 D | transporte +2 a +15 KiB con CA mínima; sección bundle 68.987 B, delta real y coste firma desconocidos | pico dinámico TLS no medido hasta HIL |
 
@@ -1243,16 +1366,23 @@ El primer flash solo se permite después de P5.1 y de aprobación humana explíc
 Aunque se cumplan, DEVELOPMENT conserva amenazas CRITICAL/HIGH documentadas y no
 se instalará a terceros.
 
-Estado actual: **NO-GO** para el primer flash de laboratorio. La validación local
-de P5.1 cumple build, tamaño y gates estáticos, pero faltan revisión humana, CI
-remota de la revisión exacta, autorización explícita y las comprobaciones HIL de
-ausencia de servicio/404 y recuperación USB. No se ha abierto ningún `COMx`.
+Estado de P5.1: el primer HIL de laboratorio ya se realizó con autorización
+humana explícita. La persona confirmó CI verde y validó SoftAP, DHCP, portal,
+persistencia, STA, dashboard y DNS; la prueba RF estableció 8,5 dBm para la
+SuperMini ensayada. Esto habilitó DEVELOPMENT controlado, no PILOT.
+
+Estado de la candidate P5.2: pytest, Ruff, diff check, build y tamaño/hash pasan
+localmente, pero sigue en **NO-GO para flash** hasta revisión humana y pruebas
+de navegador/HIL. Cualquier flash requerirá otra autorización humana específica;
+este documento no la concede.
 
 ## Criterios más estrictos para PILOT
 
 1. Cero amenazas CRITICAL abiertas. Ninguna HIGH sin control compensatorio,
    responsable, fecha y aceptación humana escrita.
-2. P5.2-P5.8 y P5.10 son obligatorios para el núcleo DNS/onboarding/recovery.
+2. P5.2 combinado, P5.5-P5.8 y P5.10 son obligatorios para el núcleo
+   DNS/onboarding/recovery, además de cerrar los residuos de canal/rate limit que
+   el plan original asignaba a P5.3/P5.4.
    Solo panel admin, upload, fetch y OTA pueden omitirse compilándolos fuera;
    P5.9 se omite únicamente si toda OTA de firmware permanece ausente.
 3. Ambos perfiles pasan host tests, fuzzing, build y CI real confirmada por el
