@@ -137,8 +137,6 @@ def test_dashboard_mutations_are_posted_with_session_csrf_header() -> None:
         "/addblock",
         "/unblock",
         "/forgetwifi",
-        "/fetchnow",
-        "/setupdate",
         "/logout",
     ):
         assert f'post("{route}"' in page
@@ -354,20 +352,23 @@ def test_configured_values_are_encoded_at_their_output_contexts() -> None:
     portal = cpp_function(source, "startConfigPortal")
     wifi_save = cpp_function(source, "handleWifiSave")
 
-    assert "jsonEscape(updateUrl)" in stats
-    assert "jsonEscape(updateStatus)" in stats
     assert "jsonEscape(customDom[i])" in stats
     assert "htmlEscape(WiFi.SSID(i))" in portal
     assert "htmlEscape(ss)" in wifi_save
 
 
 def test_http_route_inventory_and_methods_are_exact() -> None:
+    source = read_main()
     routes = sorted(
         (path, method.strip())
         for path, method in re.findall(
-            r'web\.on\(\s*"([^"]+)"\s*,\s*([^,\n)]+)', read_main()
+            r'web\.on\(\s*"([^"]+)"\s*,\s*([^,\n)]+)', source
         )
     )
+    assert 'BLOCKLIST_UPLOAD_ROUTE = "/upload"' in source
+    assert "web.addHandler(new BlocklistUploadRequestHandler())" in source
+    routes.append(("/upload", "HTTP_POST"))
+    routes.sort()
     expected = sorted(
         [
             ("/", "HTTP_GET"),  # Physically authorized captive portal.
@@ -375,12 +376,10 @@ def test_http_route_inventory_and_methods_are_exact() -> None:
             ("/addblock", "HTTP_POST"),
             ("/app.js", "HTTP_GET"),
             ("/ban", "HTTP_POST"),
-            ("/fetchnow", "HTTP_POST"),
             ("/forgetwifi", "HTTP_POST"),
             ("/login", "HTTP_GET"),
             ("/login", "HTTP_POST"),
             ("/logout", "HTTP_POST"),
-            ("/setupdate", "HTTP_POST"),
             ("/stats.json", "HTTP_GET"),
             ("/unblock", "HTTP_POST"),
             ("/upload", "HTTP_POST"),
@@ -399,14 +398,15 @@ def test_all_normal_mode_state_changes_are_post_only() -> None:
     by_path: dict[str, set[str]] = {}
     for path, method in routes:
         by_path.setdefault(path, set()).add(method.strip())
+    assert 'BLOCKLIST_UPLOAD_ROUTE = "/upload"' in source
+    assert "web.addHandler(new BlocklistUploadRequestHandler())" in source
+    by_path["/upload"] = {"HTTP_POST"}
 
     for path in (
         "/addblock",
         "/ban",
-        "/fetchnow",
         "/forgetwifi",
         "/logout",
-        "/setupdate",
         "/unblock",
         "/upload",
     ):
@@ -464,8 +464,6 @@ def test_admin_mutation_guards_precede_each_state_change() -> None:
         "handleAddBlock": 'addCustom(web.arg("d"))',
         "handleUnblock": 'removeCustom(web.arg("d"))',
         "handleForgetWifi": "clearWifiCredentials()",
-        "handleFetchNow": "fetchBlocklist(updateUrl)",
-        "handleSetUpdate": 'updateUrl = web.arg("u")',
     }
 
     for handler, mutation in mutations.items():
@@ -490,10 +488,11 @@ def test_upload_is_authorized_before_any_blocklist_swap_or_write() -> None:
 
     assert "requireAdminMutation(false)" in start
     assert start.index("requireAdminMutation(false)") < start.index(
-        "beginBlocklistSwap()"
+        "blocklistTransactionActive"
     )
-    assert "if (!uploadAuthorized) break" in start
-    assert "uploadAuthorized && upFile" in write
+    assert re.search(r"if\s*\(\s*!uploadAuthorized\s*\)", start)
+    assert "uploadAuthorized" in write
+    assert "upFile" in write
     assert "if (!uploadAuthorized) break" in end
     assert "requireAdminMutation()" in done
     assert done.index("requireAdminMutation()") < done.index("web.send")

@@ -5,8 +5,10 @@ pequeñas y deterministas. La baseline limpia de P5.1 en `dce4672` termina con
 **67 passed** y cero fallos bajo Python 3.13. Los tests no descargan blocklists
 ni acceden deliberadamente a Internet: `urlopen` está bloqueado por defecto y la
 única descarga simulada usa bytes locales controlados. Una persona confirmó
-verdes los dos jobs de GitHub Actions para `dce4672`. Ese resultado no acredita
-automáticamente la candidate P5.2 hasta ejecutar CI sobre su revisión exacta.
+verdes los dos jobs de GitHub Actions para `dce4672`. P5.2 y P5.2a están
+committed y pushed en `bbeacda`; una persona confirmó verdes sus dos jobs de CI
+y el HIL completo solicitado. Esa evidencia acredita `bbeacda`, no P5.3a ni
+ningún cambio posterior.
 
 ## Build
 
@@ -23,8 +25,8 @@ Implementado y committed en `dce4672`, con gates permanentes en
 
 - ausencia en `src/` de `ArduinoOTA`, `Update.h`, APIs `Update`, handlers de
   firmware, marcadores `[fw-ota]` y APIs OTA alternativas obvias;
-- ausencia de la ruta HTTP exacta `/update`, conservando como control positivo
-  `/upload`, `/fetchnow` y `/setupdate` para la blocklist;
+- ausencia de la ruta HTTP exacta `/update`. `/upload` se conserva como control
+  positivo para blocklist; P5.3a retira posteriormente `/fetchnow` y `/setupdate`;
 - ausencia del formulario, botón, JavaScript, mensajes y referencia al binario
   de firmware en `src/page.h`;
 - el README deja de presentar la OTA de firmware, `espota` y el instalador web
@@ -46,9 +48,11 @@ enlazada y 51.164 B de RAM, con SHA-256
 El slot conserva 101.296 B físicos libres.
 
 La inspección posterior de binario, ELF y mapa no encuentra `ArduinoOTA`,
-handlers/strings de firmware OTA ni la cadena exacta `/update`. Permanece
-`/update.cfg`, que pertenece exclusivamente a la configuración de actualización
-de blocklist y no es una ruta HTTP de firmware.
+handlers/strings de firmware OTA ni la cadena exacta `/update`. En P5.1
+permanecía `/update.cfg`, que pertenecía exclusivamente a la configuración de
+actualización de blocklist y no era una ruta HTTP de firmware. P5.3a elimina
+toda referencia de producción a ese nombre: un archivo legacy queda inerte y su
+contenido nunca se abre ni se interpreta.
 
 La persona responsable confirmó ambos jobs de CI verdes. El HIL end-to-end de
 la SuperMini validó SoftAP, DHCP, portal, guardado, reboot, STA, dashboard y DNS
@@ -60,7 +64,7 @@ ArduinoOTA y cualquier prueba destructiva del procedimiento
 
 ## P5.2 — seguridad del panel administrativo
 
-La candidate añade 32 tests estáticos permanentes en
+La baseline P5.2 añade 32 tests estáticos permanentes en
 `tests/test_p5_2_admin_security.py`. La ejecución local final de la revisión
 completa terminó con **99 passed** y cero fallos bajo Python 3.13. Los gates
 comprueban:
@@ -78,9 +82,10 @@ comprueban:
 - throttle de login creciente y acotado, sin lockout persistente;
 - recolección y allowlist de `Host` para IPv4 local o `c3adblock.local`, manejo
   explícito de `:80` y rechazo de valores arbitrarios/malformados;
-- matriz de rutas: lecturas administrativas con sesión y todas las mutaciones
-  únicamente por POST con sesión y CSRF, incluidos `/upload`, `/fetchnow`,
-  `/setupdate`, custom block/unblock, ban, logout y forget-Wi-Fi;
+- matriz de rutas de la baseline P5.2: lecturas administrativas con sesión y
+  todas las mutaciones únicamente por POST con sesión y CSRF, incluidos entonces
+  `/upload`, `/fetchnow`, `/setupdate`, custom block/unblock, ban, logout y
+  forget-Wi-Fi. P5.3a elimina las dos rutas remotas;
 - token CSRF separado para `/wifisave` dentro del portal físicamente autorizado;
 - escape HTML de `&`, `<`, `>`, comilla doble y comilla simple, escape JSON,
   construcción DOM sin HTML ejecutable y script separado de los datos;
@@ -91,21 +96,12 @@ comprueban:
 - regresiones de P5.1: `/update`/ArduinoOTA/Update ausentes, un único
   `WiFi.begin`, workaround RF a 8,5 dBm y archivos protegidos intactos.
 
-Estos gates son inspección de invariantes del código; no sustituyen ejecutar el
-firmware ni un navegador. Antes de aceptar P5.2 quedan pendientes:
-
-- crear y restablecer la contraseña con BOOT en la placa exacta, y verificar que
-  sin presencia física el bootstrap y `/wifisave` fallan cerrados;
-- login correcto/incorrecto, escalado del throttle, logout, sustitución de la
-  sesión, expiración a 30 minutos y pérdida de sesión tras reboot;
-- probar IPv4, `c3adblock.local`, `:80`, Host vacío/malformado/arbitrario y que
-  ninguna respuesta use Host no confiable para construir un redirect;
-- matriz HTTP real con GET/POST/métodos alternativos, sesión ausente/expirada y
-  CSRF ausente/incorrecto/repetido para cada mutación y upload multipart;
-- corpus XSS en navegador para dominio, URL, estado, SSID y datos persistidos
-  legacy, verificando CSP y que el contenido solo aparece como texto;
-- smoke DNS/panel y medición de heap durante PBKDF2/login; comprobar que el
-  canal HTTP claro no se confunde con confidencialidad.
+Estos gates son inspección de invariantes del código; por sí solos no sustituyen
+el firmware ni un navegador. Para la revisión committed y pushed `bbeacda`, una
+persona confirmó ambos jobs de CI verdes y el HIL completo de P5.2/P5.2a. La
+confirmación incluye la matriz física solicitada para BOOT, provisioning,
+login/sesión/CSRF/Host, dashboard y regresión DNS. No elimina el riesgo residual
+del panel HTTP claro ni acredita P5.3a.
 
 ### P5.2a — autorización física BOOT en runtime
 
@@ -130,22 +126,110 @@ de GPIO9 durante `setup()` y comprueban ahora:
 - permanecen los gates P5.2 de auth/sesión/CSRF/Host/XSS y los invariantes P5.1
   de OTA ausente, RF a 8,5 dBm y archivos protegidos.
 
-Estos son gates estructurales host. El HIL debe comprobar tiempos/rebote reales,
-persistencia borrada, refresh de formulario, reinicio tras release y fallo AP;
-no se considera validado físicamente hasta ejecutar esa matriz en la SuperMini.
-La validación local P5.2a terminó con **105 passed**, Ruff y diff checks limpios;
-PlatformIO enlazó 1.250.561 B y generó un `firmware.bin` de 1.292.272 B. Quedan
-83.984 B físicos en el slot, por encima del gate de 64 KiB. Esto no equivale a
-HIL ni autoriza un flash.
+Estos son gates estructurales host. La revisión `bbeacda` completó además el HIL
+de tiempos/rebote reales, persistencia borrada, refresh de formulario, reinicio
+tras release y comportamiento AP. P5.2a terminó localmente con **105 passed**,
+Ruff y diff checks limpios; PlatformIO enlazó 1.250.561 B y generó un
+`firmware.bin` de 1.292.272 B, dejando 83.984 B físicos. Una persona confirmó
+también ambos jobs de CI verdes. Esta baseline validada no autoriza por sí sola
+un piloto y no acredita la candidate P5.3a.
 
-P5.2 protege el acceso a upload/fetch, pero no prueba ni corrige todavía
-atomicidad, last-known-good, autenticidad, TLS, `setInsecure()` o SSRF.
+En esa baseline, P5.2 protegía el acceso a upload/fetch, pero aún no corregía
+atomicidad, last-known-good, autenticidad, TLS, `setInsecure()` o SSRF. El delta
+P5.3a actual se documenta a continuación.
 
 El build local final enlaza 1.249.513 B (90,8 %) y usa 51.292 B de RAM estática
 (15,7 %). `firmware.bin` mide 1.291.104 B, SHA-256
 `F87A9498C1E182A72E881C9C4BFBEE1AF2F2ACF9694A0B4352F0366278EB5463`, y deja
 85.152 B físicos (83,16 KiB) en el slot. Supera el margen mínimo de parada de
 64 KiB, pero sigue siendo estrecho y no autoriza un flash ni un piloto.
+
+## P5.3a — blocklist local transaccional y fetch remoto deshabilitado
+
+P5.3a conserva exclusivamente el upload manual autenticado y elimina del
+firmware, las rutas y la interfaz las funciones remotas `/fetchnow` y
+`/setupdate`, su URL, intervalo y ejecución periódica. La interfaz mantiene DOM
+seguro y muestra: «Las actualizaciones remotas de listas están desactivadas en
+esta versión. Usa únicamente archivos de blocklist validados.» No se introduce
+un sustituto HTTP/TLS ni se descarga una lista durante pytest.
+
+Los gates automatizados de esta entrega deben cubrir:
+
+- ausencia de `/fetchnow`, `/setupdate`, `HTTPClient`, `NetworkClientSecure`,
+  `WiFiClientSecure`, `setInsecure()` y del scheduler de fetch en el firmware
+  actual;
+- permanencia de `/upload` como POST con sesión y CSRF, sin recuperar rutas de
+  firmware OTA;
+- montaje LittleFS sin autoformato y recuperación antes de leer estado o iniciar
+  STA, SoftAP, mDNS, DNS o el servidor HTTP;
+- ausencia de URL/intervalo remoto y de sus listeners en `src/page.h`, junto al
+  mensaje español aprobado y al upload manual;
+- validación completa del candidato `/blocklist.new` antes de sustituir el
+  activo `/blocklist.bin`, manteniendo `/blocklist.old` como rollback durante la
+  transacción. El máximo común de generador y firmware es 104.857 registros de
+  cinco bytes, 524.285 bytes en total;
+- autorización antes de abrir el candidato, límite por cada chunk, comprobación
+  de cada write, abort/short write/overflow sin tocar el activo, respuesta 413
+  por exceso y rechazo 409 de una transacción reentrante;
+- dispatcher por `Content-Type`: multipart es el único upload aceptado; cuerpos
+  raw/urlencoded se rechazan con 415 sin acceder a `web.upload()` ni crear candidato;
+- recuperación determinista al arrancar: un activo válido gana y limpia restos;
+  sin activo válido se restaura un rollback válido; sin ambos se promueve un
+  candidato válido; si no existe ninguna copia válida se falla cerrado;
+- candidato inválido nunca reemplaza un activo válido, y hashes/entradas solo se
+  cargan desde un archivo que supera las validaciones de formato y tamaño;
+- un activo legacy válido por encima de 524.285 bytes permanece legible, pero no
+  amplía el límite de candidatos ni se elimina si el staging se queda sin espacio;
+- `/update.cfg` ya no aparece en el código de producción: cualquier copia legacy
+  queda ignorada e inerte, sin poder reactivar fetch remoto. El archivo físico
+  puede conservar una URL o token antiguo y ocupar espacio hasta una restauración
+  explícita de LittleFS;
+- regresiones permanentes de P5.1/P5.2a, `partitions.csv`, `LICENSE` y
+  `platformio.ini` intactos.
+
+La matriz de recuperación ante corte esperada es:
+
+1. Durante el upload: el activo válido gana y el candidato parcial se elimina.
+2. Después de cerrar el candidato: el activo válido gana; el candidato, sea
+   válido o inválido, se trata como staging no confirmado y se elimina.
+3. Después de validar el candidato pero antes de `active -> old`: el activo
+   válido sigue ganando y el candidato se elimina.
+4. Después de `active -> old`: el rollback válido se restaura; solo si resulta
+   inválido puede ganar un candidato completamente válido.
+5. Después de `new -> active`: el nuevo activo válido gana y se limpia el
+   rollback.
+6. Antes de limpiar `/blocklist.old`: el nuevo activo válido gana y el rollback
+   residual se elimina.
+
+Los tests host/modelo y la inspección estática no demuestran la atomicidad real
+de LittleFS ante pérdida de alimentación. Quedan pendientes HIL con cortes
+controlados en cada frontera, reinicio posterior, verificación DNS de la lista
+recuperada y confirmación de que un estado sin copia válida permanece
+fail-closed sin STA, portal, DNS ni panel. Ese estado no puede repararse desde la
+red: exige restaurar por USB una imagen LittleFS conocida y validada, con
+aprobación humana separada. Tampoco se considera resuelta la autenticidad de una
+lista subida manualmente ni la confidencialidad del panel HTTP.
+
+El gate temprano de `Content-Length` se aplica al cuerpo multipart completo con
+4.096 bytes de margen sobre el máximo de archivo, mientras el límite por chunks
+de 524.285 bytes es el control definitivo. Un filename o framing multipart
+inusualmente grande puede producir un 413 conservador aun con un archivo de
+tamaño válido. Además, `WebServer` procesa multipart de forma síncrona: los
+guards de partes adicionales y la limpieza de una transacción huérfana son
+invariantes estáticos/modelados, no una prueba HTTP real. Quedan pendientes un
+cliente lento, desconexión a mitad de body, multipart sin fichero/con varias
+partes, timeout del core, recuperación del loop/DNS y rate limiting general.
+
+La validación local integrada de P5.3a terminó con **163 passed** y Ruff sin
+errores. PlatformIO terminó `SUCCESS`: RAM estática 50.684/327.680 B (15,5 %),
+flash enlazada 1.122.703/1.376.256 B (81,6 %) y margen enlazado 253.553 B.
+`firmware.bin` mide 1.160.704 B, deja 215.552 B físicos y tiene SHA-256
+`D1A24F2D579D6B1617850B07E6FA2A403CBF90E08DDD5DD033475D33B7C34F2C`. Frente a
+P5.2a son −648 B de RAM, −127.858 B enlazados y −131.568 B físicos. El build
+emitió tres warnings porque, sin Internet, omitió la comprobación remota de
+dependencias; no fueron errores de compilación. `ci_checks repository`, ambos
+diff checks y el gate de archivos protegidos pasan localmente. La CI real y todo
+HIL P5.3a siguen pendientes.
 
 ## Integración continua — implementado en P3
 
@@ -188,14 +272,14 @@ pero no sustituye una auditoría especializada.
 
 ## Integración continua — pendiente
 
-- ejecución real de la candidate P5.2 en GitHub y confirmación humana de ambos
-  jobs para su revisión exacta;
+- ejecución real de P5.3a en GitHub y confirmación humana de ambos jobs para su
+  revisión exacta;
 - decidir si los checks serán obligatorios mediante branch protection;
 - mantener pruebas de Windows 10 real, hardware, red, DNS y panel ya enumeradas.
 
-La ejecución verde confirmada de `dce4672` valida esa revisión, no cambios
-posteriores. La inspección estructural o el parseo local del YAML tampoco
-acreditan una ejecución nueva.
+Las ejecuciones verdes confirmadas de `dce4672` y `bbeacda` validan únicamente
+esas revisiones. La inspección estructural o el parseo local del YAML tampoco
+acreditan P5.3a.
 
 ## Python — implementado en P2
 
@@ -253,21 +337,22 @@ acreditan una ejecución nueva.
 - reinicio durante escritura;
 - allowlist.
 
-## Hardware — pendiente
+## Hardware — baseline confirmada y trabajo pendiente
 
-- P5.2 auth/session/CSRF/Host/XSS en navegador y placa;
-- portal físico BOOT: hold runtime de 3 s, pulsación corta/rebote, bootstrap y
-  recuperación de contraseña fail-closed;
-- medición de tiempo/heap mínimo durante PBKDF2 y repetidos logins fallidos;
+Una persona confirmó el HIL completo solicitado de P5.2/P5.2a sobre `bbeacda`,
+incluidos auth/sesión/CSRF/Host/XSS, portal físico BOOT y recuperación runtime.
+Esa confirmación no incluye P5.3a. Para P5.3a quedan pendientes upload manual
+real, respuestas HTTP, multipart/abort/desconexión, presión de espacio y los seis
+cortes de alimentación de la matriz anterior. También siguen pendientes:
+
 - 24 horas y 7 días;
 - varios clientes;
 - reinicio router;
-- cambio Wi-Fi;
-- recuperación BOOT desde STA con hold de 5 s, release antes de reboot y regreso
-  al portal read-only.
+- cambio Wi-Fi.
 
-La baseline `dce4672` ya completó HIL end-to-end con alimentación independiente,
-SoftAP/DHCP/portal, STA, dashboard y DNS; no sustituye las pruebas P5.2 anteriores.
+La baseline `dce4672` completó HIL end-to-end con alimentación independiente,
+SoftAP/DHCP/portal, STA, dashboard y DNS. `bbeacda` añadió la confirmación HIL
+completa de P5.2/P5.2a; ninguna de ellas sustituye el HIL nuevo de P5.3a.
 
 ## Piloto mínimo — pendiente
 

@@ -36,10 +36,13 @@ if ($LASTEXITCODE -ne 0 -or $pioVersion -notmatch "6\.1\.19") {
     throw "Se requiere PlatformIO Core 6.1.19."
 }
 $pioVersion
-git status --short
-git diff --quiet HEAD -- partitions.csv LICENSE
+$workingTree = @(git status --porcelain=v1)
+if ($LASTEXITCODE -ne 0 -or $workingTree.Count -ne 0) {
+    throw "El working tree no está limpio; no atribuya el artefacto solo a HEAD."
+}
+git diff --quiet HEAD -- partitions.csv LICENSE platformio.ini
 if ($LASTEXITCODE -ne 0) {
-    throw "partitions.csv o LICENSE difieren de HEAD; no flashear."
+    throw "partitions.csv, LICENSE o platformio.ini difieren de HEAD; no flashear."
 }
 $trackedSecrets = @(git ls-files -- src/secrets.h)
 if ($LASTEXITCODE -ne 0 -or $trackedSecrets.Count -ne 0) {
@@ -54,9 +57,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
-`git ls-files -- src/secrets.h` debe producir una salida vacía y PlatformIO debe
-indicar la versión 6.1.19. No continúe si falla el build, si `partitions.csv` o
-`LICENSE` han cambiado o si desconoce el origen de la revisión.
+`git ls-files -- src/secrets.h` debe producir una salida vacía, el working tree
+debe estar limpio y PlatformIO debe indicar la versión 6.1.19. No continúe si
+falla el build, si un archivo protegido ha cambiado o si desconoce el origen de
+la revisión. Un artefacto diagnóstico construido desde cambios no committed
+requiere un procedimiento separado que registre y apruebe ese diff exacto.
 
 Registre el tamaño y el hash del artefacto exacto:
 
@@ -76,6 +81,9 @@ $slotSize = 1376256
 
 if ($firmwareSize -gt $slotSize) {
     throw "firmware.bin no cabe en el slot app."
+}
+if (($slotSize - $firmwareSize) -lt 65536) {
+    throw "El margen físico es inferior al gate de 64 KiB; no flashear."
 }
 ```
 
@@ -140,7 +148,16 @@ DNS, DHCP ni router. Abrir un monitor serie exige aprobación separada.
 ## Restaurar LittleFS únicamente si es necesario
 
 El target `upload` no restaura LittleFS. No ejecute `uploadfs` solo porque el
-firmware no arranca: primero repita el modo ROM y el flasheo de firmware.
+firmware no arranca: primero distinga un fallo de firmware de un fallo cerrado
+de filesystem. Reflashear la misma imagen de firmware no repara LittleFS; repita
+el flash de firmware únicamente si su artefacto, hash o escritura no son fiables.
+
+Desde P5.3a, LittleFS se monta sin autoformato. Si el montaje falla o no queda
+ninguna copia válida entre `/blocklist.bin`, `/blocklist.old` y
+`/blocklist.new`, el firmware se detiene deliberadamente antes de iniciar Wi-Fi,
+DNS o panel. En ese estado tampoco está disponible el recovery BOOT de la
+aplicación: la restauración física de LittleFS mediante USB es el camino de
+recuperación previsto y sigue requiriendo aprobación humana expresa.
 
 `uploadfs` sustituye el contenido completo de LittleFS y puede eliminar la
 blocklist, bans, dominios personalizados y configuración guardada allí. No
@@ -163,10 +180,18 @@ if ($LASTEXITCODE -ne 0) {
 
 $blocklist = Join-Path $repoRoot "data\blocklist.bin"
 $blocklistSize = (Get-Item -LiteralPath $blocklist).Length
-if (($blocklistSize % 5) -ne 0 -or $blocklistSize -gt 1250000) {
+if (($blocklistSize % 5) -ne 0 -or $blocklistSize -gt 524285) {
     throw "La blocklist local no cumple formato o tamaño."
 }
 Get-FileHash -Algorithm SHA256 -LiteralPath $blocklist
+
+& $pio run --environment c3 --target buildfs
+if ($LASTEXITCODE -ne 0) {
+    throw "No se pudo construir la imagen LittleFS."
+}
+$littlefsImage = Join-Path $repoRoot ".pio\build\c3\littlefs.bin"
+Get-Item -LiteralPath $littlefsImage | Select-Object FullName, Length
+Get-FileHash -Algorithm SHA256 -LiteralPath $littlefsImage
 ```
 
 Después, y solo con aprobación:
@@ -178,8 +203,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 ```
 
-La blocklist mínima sirve únicamente para el laboratorio; no convierte el
-mecanismo de actualización de blocklist en seguro.
+La blocklist mínima sirve únicamente para el laboratorio. El límite P5.3a para
+nuevos candidatos es 524.285 bytes (104.857 registros); una lista activa legacy
+mayor puede seguir leyéndose, pero no se elimina para liberar espacio durante un
+upload. Este procedimiento no demuestra autenticidad del archivo ni recuperación
+real ante cortes de alimentación.
 
 ## Si la placa no arranca
 

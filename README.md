@@ -60,7 +60,9 @@ Printing notes:
 
 ## Build & flash (PlatformIO)
 
-One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
+Firmware recovery remains USB-only. After provisioning, an administrator can
+replace blocklist data manually from the authenticated LAN dashboard; remote URL
+fetching is deliberately disabled in P5.3a.
 
 > This checkout is validated with PlatformIO Core 6.1.19. `platformio.ini` pins
 > pioarduino 55.03.37 (Arduino-ESP32 3.3.7 / ESP-IDF 5.5.2). On Windows 10 x64,
@@ -73,17 +75,20 @@ One USB flash to get going — after that, **firmware and blocklist both update 
 cp src/secrets.example.h src/secrets.h
 #    then edit src/secrets.h -> WIFI_SSID / WIFI_PASS
 
-# 2. build the blocklist hash table (default = StevenBlack base + Hagezi Light,
-#    ~140k domains, WhatsApp/social safe)
+# 2. build the blocklist hash table (maximum 104,857 hashes / 524,285 bytes)
 python3 tools/build_blocklist.py data/blocklist.bin
 
-# 3. flash firmware + the blocklist filesystem (the one and only USB flash)
+# 3. initial firmware + blocklist filesystem flash (requires hardware approval)
 pio run -t upload
 pio run -t uploadfs
 
-# 4. watch it boot, note the IP / open the dashboard
+# 4. optional serial monitor (requires separate hardware approval)
 pio device monitor          # -> http://c3adblock.local
 ```
+
+The generator never truncates a list silently. If the selected sources exceed
+104,857 unique hashes, it fails without replacing the previous output; select a
+smaller reviewed source set.
 
 ### WiFi setup (no re-flash needed)
 
@@ -102,13 +107,14 @@ dashboard's **Forget Wi-Fi** action provides the same portal path without treati
 
 ## Blocklist updates and firmware recovery
 
-The dashboard at **http://c3adblock.local** still exposes the upstream blocklist
-update features. They are not yet hardened for a pilot; see [SECURITY.md](SECURITY.md)
-before using them even on a test LAN.
+The authenticated dashboard at **http://c3adblock.local** exposes only manual
+blocklist upload. P5.3a compiles out URL configuration, scheduled fetching and
+the insecure remote transport. The device remains DEVELOPMENT-only; see
+[SECURITY.md](SECURITY.md) before using it even on a test LAN.
 
-- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
-  URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
-  on a schedule (e.g. a GitHub release asset — update it once, every device fetches it).
+- **Blocklist** — build a sorted five-byte `blocklist.bin` no larger than 524,285
+  bytes and upload it through *Blocklist → Upload*. The previous valid list stays
+  active until the candidate is fully written, validated and promoted.
 - **Firmware** — firmware updates over the network are disabled in P5.1. Build a
   reviewed image locally and use the documented, approval-gated
   [Windows 10 USB recovery procedure](docs/USB_RECOVERY_WINDOWS.md).
@@ -146,7 +152,7 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 
 - ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
 - ✅ mDNS (`c3adblock.local`) for discovery
-- ⚠️ Blocklist upload/fetch remains available for DEVELOPMENT but is not yet pilot-safe
+- ⚠️ Manual blocklist upload remains DEVELOPMENT-only; remote fetch is disabled
 - 🛑 Firmware OTA over the network and the legacy browser installers are disabled in P5.1
 - ✅ Captive-portal WiFi setup (no hardcoded creds)
 - ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win

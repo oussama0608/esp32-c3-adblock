@@ -108,9 +108,12 @@ Flujos y límites:
 2. El navegador accede por HTTP/80 al panel y sus rutas administrativas.
 3. En onboarding, un AP abierto, DNS cautivo y HTTP reciben SSID, password Wi-Fi
    y el alta local del verificador administrativo dentro de la ventana física.
-4. NVS guarda credenciales; LittleFS guarda blocklist, bans, dominios y URL.
-5. P5.1 retiró la entrega de firmware por `/update` y ArduinoOTA. Las blocklists
-   aún entran por `/upload` o `HTTPClient`, con sus riesgos propios abiertos.
+4. NVS guarda credenciales; LittleFS guarda blocklist, bans y dominios. Un
+   `/update.cfg` heredado puede seguir físicamente presente, pero P5.3a no lo
+   abre ni interpreta.
+5. P5.1 retiró la entrega de firmware por `/update` y ArduinoOTA. P5.3a conserva
+   únicamente el upload manual autenticado de blocklist; no existe `HTTPClient`
+   ni fetch remoto en el firmware de producción actual.
 6. BOOT/GPIO9 es el límite físico de recuperación de credenciales Wi-Fi.
 
 ## Resumen del registro
@@ -170,11 +173,11 @@ siendo **5 CRITICAL, 20 HIGH, 5 MEDIUM y 0 LOW** hasta que sus condiciones de
 aceptación completas permitan cierre o reclasificación. TM-18 y los riesgos de
 blocklist, XSS, CSRF y DNS permanecen `OPEN`.
 
-### Audit de rutas y política P5.2
+### Audit histórico de rutas y política P5.2
 
 El portal cautivo y el servidor STA no se ejecutan simultáneamente, aunque ambos
 reutilizan `WebServer`. `HTTP_ANY` describe el registro anterior a P5.2; la
-columna final es la política de la candidate.
+columna final documenta la baseline P5.2, no el estado posterior P5.3a.
 
 | Ruta | Método anterior | Propósito | ¿Muta? | Entrada/salida no confiable | Protección anterior | Acción P5.2 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -194,9 +197,10 @@ columna final es la política de la candidate.
 | `/wifisave` | POST | Guardar Wi-Fi y alta admin | Sí | SSID, passwords, token | SSID obligatorio | POST; ventana BOOT, CSRF de provisioning, longitudes y escape. |
 | `/update` | Ausente desde P5.1 | Firmware OTA | — | — | Compilado fuera | Debe permanecer ausente. |
 
-El scheduler que usa la URL persistida no es una ruta HTTP y no recibe una
-protección nueva por autenticar `/fetchnow` o `/setupdate`; sus riesgos quedan en
-TM-08, TM-13, TM-14 y TM-15.
+En la baseline P5.2, el scheduler que usaba la URL persistida no era una ruta
+HTTP y no recibía una protección nueva por autenticar `/fetchnow` o
+`/setupdate`. P5.3a elimina ese scheduler, ambas rutas, la URL y su estado de
+stats/UI.
 
 ### Mapa conservador de la candidate P5.2
 
@@ -212,6 +216,49 @@ TM-08, TM-13, TM-14 y TM-15.
 | TM-10, TM-11, TM-30 | BOOT controla alta/reset admin y el estado falla cerrado. | `OPEN`: portal abierto/HTTP, NVS físico y recovery integral siguen pendientes. |
 | TM-20 | Throttle solo para login. | `OPEN`: no hay rate limiting general de DNS, panel, upload o fetch. |
 | Resto | Sin cambio deliberado en P5.2. | Conserva el estado previo. |
+
+### Delta P5.3a — pipeline manual-only
+
+P5.2 y P5.2a están committed y pushed en `bbeacda`; una persona confirmó ambos
+jobs de CI verdes y el HIL completo solicitado. Esa evidencia no acredita la
+candidate P5.3a. El inventario actual de blocklist es:
+
+| Superficie | Estado P5.3a | Riesgo residual |
+| --- | --- | --- |
+| `POST /upload` | Se conserva con Host, sesión y CSRF; escribe solo `/blocklist.new`, valida en streaming y promociona con `/blocklist.old` como rollback. | HTTP claro, sin firma/procedencia, WebServer multipart síncrono y HIL de I/O/cortes pendientes. |
+| `/fetchnow` | Ruta y handler ausentes. | La ausencia debe confirmarse en CI/binario y HIL 404/405. |
+| `/setupdate` | Ruta, handler, URL e intervalo ausentes. | Un `/update.cfg` legacy queda físicamente inerte y puede retener una URL/token hasta restaurar LittleFS. |
+| Scheduler/HTTP/TLS | `HTTPClient`, `NetworkClientSecure`, `setInsecure()`, redirects y scheduler compilados fuera. | Una futura reintroducción necesita hora, CA, pin de destino, autenticidad y otra decisión. |
+| Montaje LittleFS | `LittleFS.begin(false)` y recovery antes de cualquier red; sin copia válida se detiene fail-closed. | Durabilidad real de LittleFS y recuperación USB aún necesitan HIL destructivo autorizado. |
+
+El máximo de candidato es 524.285 B, exactamente 104.857 registros little-endian
+de cinco bytes, estrictamente ascendentes y sin duplicados. Activo y rollback
+legacy pueden seguir validándose hasta 1.250.000 B, pero nunca se borran antes de
+que un candidato nuevo quepa, se cierre y se valide.
+
+La matriz de corte tiene seis fronteras: (1) durante upload, activo gana y se
+elimina el parcial; (2) tras cerrar candidate, activo gana y elimina staging no
+confirmado; (3) tras validar candidate pero antes de `active -> old`, activo gana;
+(4) tras `active -> old`, old válido se restaura; (5) tras `new -> active`, el
+nuevo activo válido gana; (6) antes de limpiar old, el nuevo activo gana y old se
+elimina. Esto está modelado en host, no probado todavía contra power-loss real.
+
+El request multipart completo tiene un gate temprano de 528.381 B: máximo de
+archivo más 4.096 B de framing. El límite streamed de 524.285 B se aplica por
+chunks independientemente de `Content-Length`. El headroom fijo puede rechazar
+de forma conservadora un filename/framing excepcional. Los guards de parte
+adicional y transacción huérfana son estáticos/modelados; no demuestran cliente
+lento, desconexión, timeout, recuperación del loop/DNS ni rate limiting real.
+
+Validación local P5.3a: 163 tests y Ruff correctos; PlatformIO `SUCCESS`, 50.684
+B de RAM, 1.122.703 B enlazados y `firmware.bin` de 1.160.704 B con SHA-256
+`D1A24F2D579D6B1617850B07E6FA2A403CBF90E08DDD5DD033475D33B7C34F2C`. Quedan
+215.552 B físicos. Los tres warnings corresponden al chequeo remoto de
+dependencias omitido sin Internet. `ci_checks repository`, los diff checks y el
+gate de archivos protegidos pasan localmente; CI real y HIL P5.3a siguen
+pendientes. TM-06, TM-08, TM-12 a TM-15 y
+TM-25 son como máximo candidatas a `MITIGATED`; ninguna queda `CLOSED` sin esa
+evidencia y sin cumplir su aceptación completa.
 
 No se cambia todavía el agregado formal por añadir documentación o tests
 estáticos. Después de validar la revisión exacta, las seis candidatas directas
@@ -374,14 +421,14 @@ condiciones completas.
 ### TM-06 — Sustitución destructiva mediante `/upload`
 
 - **ID:** TM-06.
-- **Estado P5.2:** `OPEN`; el stream y su handler final quedan guardados por
-  sesión/CSRF, pero el algoritmo destructivo no cambia.
+- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; el algoritmo destructivo
+  descrito debajo es histórico y faltan CI/multipart/power-loss HIL.
 - **Activo afectado:** blocklist, LittleFS, disponibilidad y política DNS.
 - **Atacante requerido:** cliente LAN o navegador capaz de enviar un formulario
   cross-origin.
-- **Superficie:** `/upload`, `handleUpload()` y el swap de
-  `src/main.cpp:214-266`.
-- **Escenario:** al comenzar el upload se cierra y borra la lista válida; un
+- **Superficie histórica:** `/upload`, `handleUpload()` y el swap destructivo de
+  la baseline P5.2.
+- **Escenario histórico:** al comenzar el upload se cerraba y borraba la lista válida; un
   aborto, short write, filesystem lleno o blob malicioso deja filtrado fail-open
   o instala cualquier múltiplo de cinco bytes. POST vacío/raw/urlencoded o
   multipart sin fichero puede ejecutar el callback sin objeto upload y provocar
@@ -390,15 +437,17 @@ condiciones completas.
   política persistente.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** P5.2 exige sesión/CSRF antes de aceptar el upload y en
-  su finalización; también hay POST multipart, temporal `/blocklist.new`, rechazo
-  de archivo vacío o no múltiplo de cinco y reapertura tras terminar.
-- **Controles ausentes:** límite de bytes, comprobación de writes/flush/rename,
-  orden estricto, unicidad, integridad, autenticidad y conservación de
-  last-known-good.
-- **Corrección propuesta:** mantener esta capacidad compilada fuera hasta TM-13;
-  después aplicar staging validado, cuota y commit recuperable sin desactivar la
-  lista viva.
+- **Controles actuales P5.3a:** sesión/CSRF se revalidan antes de escribir y antes
+  de promocionar; límite streamed, writes comprobados, validador acotado,
+  active/new/old, rollback y boot recovery conservan last-known-good. Un
+  dispatcher alineado con el parser del core solo accede a `web.upload()` para
+  multipart y rechaza raw/urlencoded con 415 sin persistir bytes.
+- **Controles ausentes:** autenticidad/firma, prueba HTTP multipart real, timeout
+  y rate limit; short write, filesystem lleno, fallos de rename y cortes solo se
+  modelan/inspeccionan hasta completar HIL.
+- **Corrección propuesta:** mantener el upload fuera de PILOT hasta completar el
+  HIL multipart/LittleFS, la autenticidad del artefacto y los límites de tasa; no
+  volver al swap destructivo ni ampliar el máximo para forzar que una lista quepa.
 - **Test necesario:** abortar en cada chunk, short write, out-of-space, archivo
   enorme/desordenado/duplicado y fallo de rename; añadir POST vacío, raw,
   urlencoded, multipart sin fichero y Content-Type incorrecto, con reboot tras
@@ -447,25 +496,26 @@ condiciones completas.
 ### TM-08 — Fetch y configuración inseguros
 
 - **ID:** TM-08.
-- **Estado P5.2:** `OPEN`; `/fetchnow` y `/setupdate` pasan a POST protegido, pero
-  ni el fetch ni el scheduler cambian su modelo de transporte/estado.
+- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; `/fetchnow`,
+  `/setupdate`, configuración y scheduler están ausentes de fuente, pendiente de
+  confirmación CI/binario/HIL.
 - **Activo afectado:** blocklist, configuración persistente, disponibilidad DNS
   y heap.
 - **Atacante requerido:** cliente LAN, CSRF o servidor remoto controlado.
-- **Superficie:** `/fetchnow`, `/setupdate`, `load/saveUpdateCfg()` y scheduler en
-  `src/main.cpp:268-305,420-425,436-439`.
-- **Escenario:** se persiste una URL arbitraria y se dispara una descarga
+- **Superficie histórica:** `/fetchnow`, `/setupdate`, `load/saveUpdateCfg()` y
+  scheduler de la baseline P5.2.
+- **Escenario histórico:** se persistía una URL arbitraria y se disparaba una descarga
   síncrona, grande, lenta, parcial o repetida; un intervalo extremo puede
   desbordar la aritmética de milisegundos.
 - **Impacto:** DoS, fail-open de filtrado, llenado de LittleFS y persistencia de
   un origen atacante.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales:** P5.2 exige sesión y CSRF para configurar o disparar la
-  ruta; se mantienen URL no vacía, intervalo mínimo nominal de una hora, timeout
-  HTTP de 20 s, idle de 15 s y requisito de HTTP 200.
-- **Controles ausentes:** longitudes y máximo de intervalo, límite total,
-  operación asíncrona, control de redirects y conservación segura de la lista.
+- **Controles actuales P5.3a:** no hay ruta, URL, intervalo, scheduler ni cliente
+  remoto. `/update.cfg` no se interpreta y el upload manual es transaccional.
+- **Controles ausentes:** confirmar ausencia en CI/binario y HIL; el archivo
+  legacy puede permanecer físicamente y retener una URL/token hasta recuperar
+  LittleFS. No existe una arquitectura segura para reactivar fetch.
 - **Corrección propuesta:** mantener fetch remoto deshabilitado hasta completar
   TM-13, TM-14 y TM-15; usar estado acotado, fallo cerrado y configuración
   persistida atómicamente.
@@ -577,20 +627,23 @@ condiciones completas.
 ### TM-12 — Autoformato con `LittleFS.begin(true)`
 
 - **ID:** TM-12.
+- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; el autoformato se
+  retiró y falta validar corrupción/recovery físico en HIL.
 - **Activo afectado:** blocklist, bans, dominios personalizados y configuración
   de update.
 - **Atacante requerido:** no es necesario; basta corrupción, incompatibilidad o
   fallo de montaje. Un atacante que provoque escrituras aumenta la probabilidad.
-- **Superficie:** `LittleFS.begin(true)` en `src/main.cpp:394`.
-- **Escenario:** al fallar el montaje, `true` permite formatear automáticamente y
+- **Superficie histórica:** `LittleFS.begin(true)` en la baseline P5.2.
+- **Escenario histórico:** al fallar el montaje, `true` permitía formatear automáticamente y
   borrar toda la política; el firmware después continúa arrancando.
 - **Impacto:** pérdida silenciosa de configuración y filtrado fail-open.
 - **Probabilidad:** Media durante cortes, desgaste o imágenes incompatibles.
 - **Severidad:** HIGH.
-- **Controles actuales:** se imprime `LittleFS FAILED` si incluso la operación
-  con autoformato falla.
-- **Controles ausentes:** montaje no destructivo, modo recovery, confirmación
-  física, health marker, backup y error operativo visible.
+- **Controles actuales P5.3a:** `LittleFS.begin(false)`; mount o recovery fallidos
+  detienen el firmware antes de Wi-Fi/DNS/panel y exigen recuperación USB.
+- **Controles ausentes:** HIL con filesystem corrupto/cortes, preservación de una
+  imagen de diagnóstico y autenticidad/procedencia de la imagen LittleFS de
+  recuperación.
 - **Corrección propuesta:** montar con `false`; ante fallo no formatear, no
   presentar estado sano y ofrecer recuperación explícita que preserve una copia
   para diagnóstico.
@@ -604,12 +657,14 @@ condiciones completas.
 ### TM-13 — Blocklist no transaccional ni validada
 
 - **ID:** TM-13.
+- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; el swap destructivo
+  descrito debajo es histórico y la transacción/recovery necesita HIL de fallos y
+  cortes reales.
 - **Activo afectado:** integridad, autenticidad y disponibilidad de la blocklist.
 - **Atacante requerido:** cliente LAN, servidor remoto o fallo de I/O/potencia.
-- **Superficie:** `beginBlocklistSwap()`, `commitNewBlocklist()` y
-  `reopenBlocklist()` en `src/main.cpp:214-235`, más carga/lectura en
-  `src/main.cpp:68-76,179,394-396`, usados por boot, upload y fetch.
-- **Escenario:** la lista viva se elimina antes de recibir la nueva; solo se
+- **Superficie histórica:** `beginBlocklistSwap()`, `commitNewBlocklist()` y el
+  fetch de la baseline P5.2; esos helpers están ausentes en P5.3a.
+- **Escenario histórico:** la lista viva se eliminaba antes de recibir la nueva; solo se
   valida tamaño positivo múltiplo de cinco, se ignora el resultado de rename y
   `numHashes=0` fuerza fail-open. En boot se usa `size()/5` sin validar resto,
   orden o unicidad; `seek/read` no se comprueban. La condición `numHashes` también
@@ -618,11 +673,11 @@ condiciones completas.
   negativos, corrupción y pérdida de bloqueo tras cualquier fallo.
 - **Probabilidad:** Alta porque ocurre en cada update y hay rutas no autenticadas.
 - **Severidad:** HIGH.
-- **Controles actuales:** archivo temporal con nombre fijo, chequeo mínimo del
-  formato de cinco bytes y reapertura al final.
-- **Controles ausentes:** last-known-good, límite, orden numérico estricto,
-  deduplicación, lectura/escritura completa, digest/firma, journaling y boot
-  recovery.
+- **Controles actuales P5.3a:** validador streaming acotado, límite 524.285 B,
+  orden estricto/unicidad, writes completos, active/new/old, rollback comprobado,
+  reapertura/revalidación y recovery determinista antes de red.
+- **Controles ausentes:** digest/firma/procedencia, journaling/durabilidad
+  garantizada, fault injection C++ real, multipart en WebServer y power-cut HIL.
 - **Corrección propuesta:** validar en streaming a un staging que quepa, cerrar y
   verificar antes de commit, conservar la lista activa y recuperar anterior o
   nueva tras reinicio. Si no caben dos copias, rechazar sin tocar la viva o
@@ -636,29 +691,32 @@ condiciones completas.
   lectura completa, orden estricto, unicidad e integridad/autenticidad según
   origen; nunca queda una parcial ni `numHashes=0` por efecto del update.
 
-Restricción física: LittleFS tiene 1.376.256 bytes y P2 permite blobs de hasta
-1.250.000 bytes. No caben una copia viva y otra staging al máximo actual. Incluso
-dos copias de la lista auditada de 725.035 bytes sumarían 1.450.070 bytes antes
-de metadatos. Sin cambiar `partitions.csv`, P5 deberá reducir el máximo admitido
-para updates transaccionales o mantenerlos deshabilitados; el slot OTA de app no
-se usará como staging porque eliminaría recuperación de firmware.
+Restricción física histórica: LittleFS tiene 1.376.256 bytes y P2 permitía blobs
+de hasta 1.250.000 bytes, por lo que no cabían live y staging al máximo. P5.3a
+reduce solo los candidatos nuevos a 524.285 B; un activo legacy puede leerse
+hasta el máximo anterior y el upload falla sin borrarlo si no existe espacio para
+coexistir. El slot OTA de app no se usa como staging.
 
 ### TM-14 — HTTP y TLS con `setInsecure()`
 
 - **ID:** TM-14.
+- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; la superficie remota
+  está compilada fuera, pendiente de CI/binario/HIL para la revisión exacta.
 - **Activo afectado:** autenticidad de blocklist y confidencialidad/integridad de
   la sesión remota.
 - **Atacante requerido:** servidor malicioso, DNS comprometido, AP/router hostil
   o intermediario de red.
-- **Superficie:** `fetchBlocklist()` en `src/main.cpp:279-305`.
-- **Escenario:** se permite `http://`; para HTTPS se llama a `setInsecure()` y se
+- **Superficie histórica:** `fetchBlocklist()` de la baseline P5.2.
+- **Escenario histórico:** se permitía `http://`; para HTTPS se llamaba a `setInsecure()` y se
   siguen redirects, por lo que no se autentica el servidor ni el destino final.
 - **Impacto:** instalación de política maliciosa, fail-open, tracking y DoS.
 - **Probabilidad:** Media; aumenta en redes públicas o servidor comprometido.
 - **Severidad:** HIGH.
-- **Controles actuales:** HTTP 200, timeouts parciales y API TLS disponible.
-- **Controles ausentes:** rechazo de HTTP, cadena de confianza, hostname, tiempo
-  fiable, política de redirects y autenticidad del artefacto.
+- **Controles actuales P5.3a:** no existe cliente remoto, HTTP, TLS, redirect ni
+  `setInsecure()` de blocklist. Solo permanece upload manual local.
+- **Controles ausentes:** autenticidad/firma del archivo manual y confirmación de
+  ausencia en CI/binario/HIL. Hora, CA, hostname y redirects siguen sin diseño y
+  bloquean cualquier reintroducción futura.
 - **Corrección propuesta:** descarga remota deshabilitada por defecto. Si vuelve,
   solo HTTPS verificado con confianza mínima mantenible, redirects revalidados y
   firma/digest autenticado; nunca fallback a `setInsecure()`.
@@ -678,22 +736,25 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-15 — URLs configurables y SSRF
 
 - **ID:** TM-15.
+- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; URL, rutas, scheduler y
+  cliente remoto están ausentes, pendiente de CI/binario/HIL.
 - **Activo afectado:** servicios de la LAN, router, dispositivo y secretos
   incluidos accidentalmente en URLs.
 - **Atacante requerido:** cliente LAN/CSRF o administrador engañado.
-- **Superficie:** argumento `u` de `/setupdate`, redirects y `HTTPClient` en
-  `src/main.cpp:279-305,421-425`.
-- **Escenario:** el ESP realiza peticiones a loopback, link-local, IP privadas,
+- **Superficie histórica:** argumento `u` de `/setupdate`, redirects y
+  `HTTPClient` de la baseline P5.2.
+- **Escenario histórico:** el ESP realizaba peticiones a loopback, link-local, IP privadas,
   router, puertos no previstos o un redirect fuera de política; la URL completa
   se guarda, imprime y devuelve en stats.
 - **Impacto:** escaneo/acceso desde una posición de red privilegiada, acciones en
   servicios internos, fuga de tokens y bloqueo del loop.
 - **Probabilidad:** Alta por falta total de validación y autenticación.
 - **Severidad:** HIGH.
-- **Controles actuales:** se rechaza string vacío y `HTTPClient.begin()` puede
-  rechazar algunas URLs sintácticamente inválidas.
-- **Controles ausentes:** parser estricto, allowlist, esquema/puerto, userinfo,
-  resolución y revalidación de IP, redirects, longitud y redacción.
+- **Controles actuales P5.3a:** no se acepta, persiste, muestra ni solicita una
+  URL remota; `/update.cfg` queda inerte y no se interpreta.
+- **Controles ausentes:** una copia física legacy puede retener datos sensibles;
+  no hay parser/allowlist/pinning porque fetch permanece deshabilitado. Cualquier
+  reintroducción debe diseñar todos esos controles antes de abrir un socket.
 - **Corrección propuesta:** eliminar URL arbitraria; usar una allowlist compilada
   de URLs exactas `https://host:443/ruta` o dejarla vacía. Rechazar IP literal,
   rangos especiales, credenciales y
@@ -745,9 +806,11 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 - **Activo afectado:** toda configuración mutable, Wi-Fi, blocklist y firmware.
 - **Atacante requerido:** sitio web malicioso visitado desde un navegador con
   acceso a la LAN; no necesita leer respuestas.
-- **Superficie:** GET mutantes `/ban`, `/addblock`, `/unblock`, `/forgetwifi`,
-  `/fetchnow`, `/setupdate`, y POST `/upload`, `/update`, `/wifisave`.
-- **Escenario:** imágenes, formularios o peticiones cross-origin activan cambios;
+- **Superficie histórica:** GET mutantes `/ban`, `/addblock`, `/unblock`,
+  `/forgetwifi`, `/fetchnow`, `/setupdate`, y POST `/upload`, `/update`,
+  `/wifisave`. En P5.3a `/fetchnow`, `/setupdate` y `/update` están ausentes; las
+  mutaciones restantes son POST con los guards P5.2.
+- **Escenario histórico:** imágenes, formularios o peticiones cross-origin activaban cambios;
   una futura cookie agravaría el problema. `web.on(uri, handler)` registra
   HTTP_ANY: `/`, stats y mutaciones sin método aceptan todos los métodos del core.
   CSRF ordinario dispara GET y POST malformado/DoS; cargar un binario elegido
@@ -834,13 +897,13 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-20 — Ausencia de rate limiting
 
 - **ID:** TM-20.
-- **Estado P5.2:** `OPEN`; solo el login recibe throttle RAM creciente. DNS,
-  mutaciones, upload y fetch aún carecen de cuotas generales.
+- **Estado P5.3a:** `OPEN`; solo el login recibe throttle RAM creciente. DNS,
+  mutaciones y upload manual aún carecen de cuotas generales; fetch está ausente.
 - **Activo afectado:** CPU, heap, flash, DNS y disponibilidad del panel.
 - **Atacante requerido:** cliente LAN o cliente DNS configurado/comprometido.
-- **Superficie:** UDP/53, rutas HTTP, uploads y fetch inmediato.
+- **Superficie:** UDP/53, rutas HTTP y upload manual.
 - **Escenario:** ráfagas DNS con upstream caído bloquean hasta 16 esperas de un
-  segundo por vuelta; peticiones web, escrituras o fetches repetidos no tienen
+  segundo por vuelta; peticiones web o escrituras repetidas no tienen
   cuota por IP ni global.
 - **Impacto:** DNS/panel inaccesible, watchdog/reset, desgaste y fragmentación.
 - **Probabilidad:** Alta.
@@ -849,8 +912,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
   tablas máximas y timeouts parciales. El presupuesto no es rate limiting.
 - **Controles ausentes:** token bucket por cliente/global, límites de concurrencia
   y tamaño, backoff, cooldown de flash y métricas de rechazo.
-- **Corrección propuesta:** cuotas separadas para DNS, login, mutaciones, upload y
-  fetch; cortar pronto y mantener turnos para loop/watchdog.
+- **Corrección propuesta:** cuotas separadas para DNS, login, mutaciones y upload;
+  cortar pronto y mantener turnos para loop/watchdog.
 - **Test necesario:** reloj falso para umbral/recarga, IPs múltiples, upstream
   caído, uploads lentos y carga sostenida mientras se consulta salud.
 - **Condición de aceptación:** durante diez minutos a dos veces la cuota
@@ -864,12 +927,11 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 - **ID:** TM-21.
 - **Activo afectado:** heap, estabilidad, watchdog y disponibilidad DNS/HTTP.
 - **Atacante requerido:** cliente LAN/DNS o uso repetido de los máximos normales.
-- **Superficie:** 96 `Dev` con `String`, 200 `String` de custom domains, JSON por
-  concatenación, HTML del portal, buffers HTTP/TLS y URLs en
-  `src/main.cpp:39-60,194-207,279-300,348-360`.
-- **Escenario:** entradas largas y ciclos de stats/fetch fuerzan asignaciones y
-  realocaciones; el heap total puede parecer suficiente mientras el mayor bloque
-  libre ya no admite TLS o una respuesta JSON.
+- **Superficie P5.3a:** 96 `Dev` con `String`, 200 `String` de custom domains,
+  JSON por concatenación, HTML del portal y parser multipart HTTP síncrono.
+- **Escenario:** entradas largas, campos multipart no-file y ciclos de stats
+  fuerzan asignaciones y realocaciones; el heap total puede parecer suficiente
+  mientras el mayor bloque libre ya no admite una respuesta JSON.
 - **Impacto:** fallo de asignación, respuesta truncada, reset y DNS intermitente.
 - **Probabilidad:** Media.
 - **Severidad:** HIGH.
@@ -881,8 +943,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
   repetidas, usar buffers acotados/streaming y medir heap mínimo y largest block.
 - **Test necesario:** tras diez minutos de warm-up con tablas al máximo, registrar
   cada segundo free heap, minimum free heap, largest free block y el pico de la
-  mayor asignación individual (`A_max`); ejecutar 10.000 ciclos stats+DNS y fetch
-  simulado, y repetir la misma muestra final en HIL.
+  mayor asignación individual (`A_max`); ejecutar 10.000 ciclos stats+DNS y
+  uploads adversariales simulados, y repetir la misma muestra final en HIL.
 - **Condición de aceptación:** cero resets/OOM; la mediana de free heap y largest
   block de los últimos 60 s no cae más del 5 % respecto a los 60 s posteriores
   al warm-up, y `largest_free_block >= ceil(1,20 * A_max)` en cada muestra.
@@ -1121,8 +1183,8 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 ### TM-30 — Recuperación física mediante BOOT
 
 - **ID:** TM-30.
-- **Estado P5.2a:** `PARTIALLY MITIGATED`; implementación host completada, HIL
-  físico pendiente.
+- **Estado P5.2a:** `PARTIALLY MITIGATED`; implementación, CI y HIL acordado
+  confirmados en `bbeacda`. Quedan pruebas de fallo NVS y recovery USB/FS.
 - **Activo afectado:** disponibilidad, credenciales Wi-Fi y capacidad de recuperar
   una unidad no conectada.
 - **Atacante requerido:** acceso físico al dispositivo; el fallo también puede
@@ -1158,7 +1220,11 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
   vuelve al portal read-only; el formulario requiere un nuevo hold de 3 s. El
   hash de una restauración USB known-good coincide con el artefacto autorizado.
 
-## Cinco riesgos principales
+## Cinco riesgos principales de la baseline P4
+
+Esta lista conserva la priorización que decidió P5.1. El estado actual y sus
+riesgos residuales están en «Delta P5.3a»; no debe interpretarse como inventario
+de rutas actualmente compiladas.
 
 1. **Ejecución de firmware por red:** `/update`, ArduinoOTA y falta de firma
    (TM-07, TM-09 y TM-26).
@@ -1232,7 +1298,7 @@ el rate limiting general.
 | **P5.1** | Retirar `/update`, ArduinoOTA y UI | TM-07, TM-09, TM-26 | Committed en `dce4672`; CI verde confirmada y HIL funcional completado. |
 | **P5.2** | Panel combinado: encoding/DOM, PBKDF2, BOOT, sesión, POST+CSRF, Host, headers y throttle login | TM-01, TM-02, TM-16 a TM-20 | Host/build y después browser/HIL; HTTP claro mantiene PILOT en NO-GO. |
 | **P5.3/P5.4 originales** | Absorbidos por P5.2 para controles de código; quedan canal, interfaz, Origin/reautenticación y rate limit general | TM-01, TM-17 a TM-20, TM-28 | No se declaran completos por añadir auth sobre HTTP. |
-| **P5.5** | C: blocklist last-known-good, límites, validación y commit recuperable | TM-06, TM-12, TM-13, TM-25 | Upload sigue compilado fuera hasta pasar fault injection y capacidad real. |
+| **P5.3a** | C parcial: blocklist manual last-known-good, límites, validación, recovery y fetch eliminado | TM-06, TM-08, TM-12 a TM-15, TM-25 | Implementado localmente; upload sigue fuera de PILOT hasta CI/HIL, autenticidad y capacidad real. |
 | **P5.6** | D: HTTPS verificado, autenticidad de artefacto y política SSRF | TM-08, TM-14, TM-15 | Fetch remoto sigue compilado fuera si el coste/ciclo CA no es aceptable. |
 | **P5.7** | Portal físico/temporal, NVS/FS endurecidos, reconexión y recovery probado | TM-10 a TM-12, TM-24, TM-25, TM-30 | Bloqueante de PILOT. |
 | **P5.8** | Parser DNS, asociación upstream, cuotas y presupuesto de heap | TM-20 a TM-23 | Bloqueante de PILOT y requiere fuzz/HIL. |
@@ -1253,12 +1319,11 @@ Utilizable únicamente en nuestra LAN de pruebas:
 - sin port-forward, DMZ, relay cloud ni administración WAN; el firmware no
   cambia router, DNS, DHCP ni Wi-Fi;
 - OTA de firmware siempre compilada fuera después de P5.1;
-- upload/fetch de blocklist solo detrás de auth/CSRF desde P5.2, URL vacía por
-  defecto y ejercitados únicamente en pruebas deliberadas; su implementación no
-  es todavía segura ni está permitida en PILOT;
-- antes de P5.10, solo SSID de laboratorio deliberadamente no sensible y URL de
-  update vacía; nunca password, token, QNAME ni bypass. P5.10 elimina/redacta
-  también SSID y URL antes de PILOT;
+- upload manual de blocklist solo detrás de auth/CSRF y ejercitado en pruebas
+  deliberadas; fetch, URL e intervalo remotos están ausentes. El upload no está
+  permitido en PILOT;
+- antes de P5.10, solo SSID de laboratorio deliberadamente no sensible; nunca
+  password, token, QNAME ni bypass;
 - assertions y nombre de perfil visibles para impedir confundirlo con PILOT;
 - recuperación física/USB documentada. Flasheo y puerto serie siguen requiriendo
   aprobación humana independiente.
@@ -1276,8 +1341,8 @@ Mínimo antes de instalarlo a otra persona:
 - la candidate P5.2 autentica y protege de CSRF/rebinding a nivel de aplicación,
   pero administración permanece ausente/read-only para PILOT hasta proteger el
   canal y pasar browser/HIL;
-- upload ausente hasta P5.2-P5.5; fetch ausente hasta P5.2-P5.6. Deshabilitar es
-  una solución válida si no caben staging, CA o firma;
+- upload manual ausente/read-only para PILOT hasta completar autenticidad y HIL
+  transaccional; fetch remoto permanece compilado fuera sin fecha de reapertura;
 - una administración sobre HTTP claro no se aprueba solo por añadir password:
   debe estar ausente/limitada a una ventana física o usar un canal que proteja
   credencial y sesión; aceptar HTTP deja un HIGH residual explícito;
@@ -1329,6 +1394,7 @@ Mínimo antes de instalarlo a otra persona:
 | Baseline P3 | 1.298.656/1.376.256 B; 77.600 B libres | 53.124/327.680 B estáticos |
 | P5.1 `dce4672` medido | 1.274.960/1.376.256 B; 101.296 B libres; 1.234.851 B enlazados | 51.164/327.680 B; ahorro dinámico no medido |
 | P5.2 combinado, medido localmente | 1.291.104/1.376.256 B físicos; 85.152 B (83,16 KiB) libres; 1.249.513 B enlazados | 51.292/327.680 B estáticos; pico PBKDF2 aún debe medirse en HIL |
+| P5.3a manual-only, medido localmente | 1.160.704/1.376.256 B físicos; 215.552 B libres; 1.122.703 B enlazados | 50.684/327.680 B estáticos; heap dinámico pendiente de HIL |
 | P5.5 C | +2 a +10 KiB estimados | <1 KiB si la validación es streaming; exige espacio flash de staging |
 | P5.6 D | transporte +2 a +15 KiB con CA mínima; sección bundle 68.987 B, delta real y coste firma desconocidos | pico dinámico TLS no medido hasta HIL |
 
@@ -1391,8 +1457,9 @@ este documento no la concede.
 4. Auth/CSRF/rebinding/rate limit y un canal que proteja credencial/sesión están
    activos, o el panel administrativo está ausente; portal temporal con presencia
    física y recovery probado. HTTP claro con password conserva un HIGH abierto.
-5. Update de blocklist conserva last-known-good tras cada fallo y corte con un
-   tamaño real que quepa; si no, upload/fetch permanecen ausentes.
+5. Update manual de blocklist conserva last-known-good tras cada fallo y corte
+   con un tamaño real que quepa; si no, queda ausente/read-only. El fetch remoto
+   permanece ausente.
 6. No existe HTTP remoto, `setInsecure`, SSRF ni URL arbitraria. Ningún canal de
    firmware por red funciona sin firma; el reflasheo USB exige hash, provenance y
    revisión humana, aunque P5.9 se omita.

@@ -6,9 +6,10 @@ NetShield Mini está en desarrollo y **todavía no se considera seguro para un
 piloto ni para un despliegue doméstico**. No existe una versión de producción
 con soporte de seguridad. La clasificación de diseño permanece en cinco
 amenazas CRITICAL, veinte HIGH y cinco MEDIUM. P5.1 mantiene TM-07, TM-09,
-TM-26 y TM-27 en `MITIGATED`, no `CLOSED`. La candidate P5.2 reduce de forma
-directa TM-01, TM-02 y TM-16 a TM-19, pero no las cierra mientras falten la
-validación completa y los tests de navegador/HIL. El registro, los tests y las
+TM-26 y TM-27 en `MITIGATED`, no `CLOSED`. P5.2/P5.2a reducen de forma directa
+TM-01, TM-02 y TM-16 a TM-19. Están committed y pushed en `bbeacda`; una persona
+confirmó ambos jobs de CI verdes y el HIL completo solicitado, pero las amenazas
+no se cierran mientras el panel continúe sobre HTTP claro. El registro, los tests y las
 condiciones de aceptación están en
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
@@ -18,10 +19,13 @@ committed en `dce4672`; una persona confirmó verdes sus jobs `python-quality` y
 `firmware-build`, y el HIL end-to-end validó SoftAP/DHCP/portal, persistencia,
 STA, panel y DNS. La limitación de potencia a 8,5 dBm queda documentada como un
 workaround observado en la ESP32-C3 SuperMini probada, no como requisito de
-todos los ESP32-C3. Los demás controles de seguridad del dispositivo siguen
-pendientes.
+todos los ESP32-C3. P5.2/P5.2a están confirmados únicamente para `bbeacda`; esa
+evidencia no se extrapola a P5.3a. Los demás controles de seguridad del
+dispositivo siguen pendientes. P5.3a deshabilita el fetch remoto de blocklists y convierte el
+upload manual en un reemplazo recuperable; estas reducciones no autentican el
+archivo ni convierten el dispositivo en apto para piloto.
 
-No se debe flashear la candidate P5.2 a una unidad piloto ni convertirla en DNS
+No se debe flashear la candidate P5.3a a una unidad piloto ni convertirla en DNS
 de una red real. Cualquier nuevo flash de laboratorio queda condicionado a sus
 gates, a [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) y a otra aprobación humana
 explícita.
@@ -37,17 +41,17 @@ explícita.
 
 ## Cinco bloqueantes principales
 
-1. La candidate P5.2 añade identidad, sesión, CSRF y allowlist de `Host`, pero el
-   panel sigue sobre HTTP claro y necesita browser/HIL; una exposición WAN
-   agravaría el impacto.
-2. Upload/fetch destruyen primero la blocklist válida, aceptan validación mínima,
-   permiten HTTP/`setInsecure()` y exponen SSRF.
-3. La candidate P5.2 sustituye los sinks DOM peligrosos, separa JavaScript y
-   aplica escape contextual, pero el corpus XSS aún debe pasar en navegador.
+1. P5.2/P5.2a ya superaron el HIL acordado de panel y recovery BOOT, pero el
+   panel sigue sobre HTTP claro y una exposición WAN agravaría el impacto.
+2. P5.3a elimina el fetch HTTP/TLS configurable y hace recuperable el upload,
+   pero una blocklist manual todavía carece de firma/procedencia y necesita HIL
+   de corte de alimentación sobre LittleFS.
+3. P5.2 sustituye los sinks DOM peligrosos, separa JavaScript y aplica escape
+   contextual; el HIL funcional no sustituye un corpus XSS adversarial completo.
 4. El parser DNS, la asociación upstream, los límites de tasa y el heap no tienen
-   todavía tests host, fuzzing ni validación HIL.
+   todavía fuzzing, carga sostenida ni HIL adversarial.
 5. La procedencia, firma y anti-downgrade del firmware USB no están resueltos;
-   quedan binarios legacy para auditoría y la recuperación física no tiene HIL.
+   quedan binarios legacy y la restauración de LittleFS/power-loss no tiene HIL.
 
 ## Estado de P5.1
 
@@ -67,13 +71,12 @@ confirmados por una persona y HIL funcional end-to-end:
 
 La clean candidate de `dce4672` mide 1.274.960 bytes físicos, enlaza 1.234.851
 bytes y usa 51.164 bytes de RAM estática. Quedan 101.296 bytes físicos en el
-slot. Las actualizaciones de
-blocklist no se consideran seguras por ello: upload permanece fuera de PILOT
-hasta P5.2-P5.5; fetch hasta P5.2-P5.6, incluidos TLS, autenticidad y defensa
-SSRF.
+slot. P5.3a conserva únicamente el upload manual y retira el fetch remoto; el
+upload permanece fuera de PILOT hasta validar autenticidad, límites y recovery
+real ante cortes.
 
 El orden completo P5.1-P5.10 y la comparación A-E están registrados en
-`docs/THREAT_MODEL.md`. La entrega P5.2 actual combina los controles de panel
+`docs/THREAT_MODEL.md`. La entrega P5.2 combinó los controles de panel
 que ADR-004 había separado entre P5.2, P5.3 y P5.4; no adelanta los parches de
 integridad de blocklist, TLS/SSRF, DNS o filesystem.
 
@@ -101,9 +104,50 @@ integridad de blocklist, TLS/SSRF, DNS o filesystem.
 - HTML/JSON se codifican por contexto, el dashboard evita construir contenido no
   confiable mediante HTML ejecutable y las respuestas llevan headers ligeros de
   no-cache, MIME, referrer y CSP.
-- `/upload`, `/fetchnow` y `/setupdate` quedan detrás de estos controles de
-  acceso. P5.2 **no** corrige todavía el swap destructivo, HTTP remoto,
-  `setInsecure()`, autenticidad de blocklists ni SSRF.
+- En la baseline P5.2, `/upload`, `/fetchnow` y `/setupdate` quedaron detrás de
+  estos controles de acceso. P5.3a conserva `/upload` y elimina las dos rutas
+  remotas; la autenticidad de blocklists sigue pendiente.
+
+## Diseño de la candidate P5.3a
+
+- No existe actualización remota de blocklist: `/fetchnow`, `/setupdate`, URL,
+  intervalo, scheduler, clientes HTTP/TLS y controles de UI quedan compilados
+  fuera. Un `/update.cfg` legacy queda inerte: no se abre, interpreta ni usa para
+  volver a habilitar fetch, pero puede conservar físicamente una URL o token
+  histórico y ocupar LittleFS hasta una restauración explícita.
+- El panel conserva el upload manual autenticado con CSRF e informa: «Las
+  actualizaciones remotas de listas están desactivadas en esta versión. Usa
+  únicamente archivos de blocklist validados.»
+- `/blocklist.new` se cierra y valida antes de sustituir `/blocklist.bin`.
+  `/blocklist.old` mantiene la última copia válida durante el reemplazo. El
+  límite de nuevos candidatos es 104.857 registros o 524.285 bytes. Una lista
+  activa legacy válida puede seguir leyéndose, pero nunca se borra para liberar
+  espacio: el upload se rechaza si no puede coexistir con ella.
+- Al arrancar, un activo válido tiene precedencia; sin él se restaura un rollback
+  válido y, solo si tampoco existe, se promueve un candidato válido. Sin ninguna
+  copia válida, la carga falla cerrada antes de iniciar cualquier servicio de
+  red. LittleFS no se autoformatea y los restos se limpian sin presentar una
+  lista vacía como actualización correcta. Recuperar ese estado exige USB y una
+  imagen LittleFS conocida y validada, bajo aprobación humana separada.
+- Esta secuencia reduce TM-06/TM-13 y compila fuera la superficie de TM-08,
+  TM-14 y TM-15 asociada al fetch. Las amenazas no se consideran cerradas sin CI
+  confirmada y HIL de cortes; el upload tampoco verifica todavía firma o
+  procedencia.
+- El request multipart completo admite como filtro temprano 4.096 B sobre el
+  máximo del fichero; el límite streamed de 524.285 B sigue siendo definitivo.
+  Cuerpos raw/urlencoded se rechazan con 415 sin abrir un candidato.
+  El parser `WebServer` es síncrono: un framing excepcional puede producir un 413
+  conservador y siguen pendientes cliente lento, timeout, multipart malformado,
+  recuperación de transacción huérfana, disponibilidad DNS y rate limiting real.
+
+La validación local P5.3a termina con 163 tests y Ruff correctos. PlatformIO
+termina `SUCCESS` con 50.684 B de RAM, 1.122.703 B de flash enlazada y un
+`firmware.bin` de 1.160.704 B; quedan 215.552 B físicos y el SHA-256 es
+`D1A24F2D579D6B1617850B07E6FA2A403CBF90E08DDD5DD033475D33B7C34F2C`. Los tres
+warnings corresponden a la comprobación remota de dependencias omitida por falta
+de Internet. `ci_checks repository`, los diff checks y el gate de archivos
+protegidos pasan localmente; CI real y HIL P5.3a siguen pendientes. No se
+autoriza flash ni piloto.
 
 ## Perfiles permitidos
 
@@ -111,9 +155,9 @@ integridad de blocklist, TLS/SSRF, DNS o filesystem.
 
 Solo para nuestra placa y LAN aislada de pruebas, sin tráfico personal, sin
 administración WAN y sin configurarlo como DNS de una red real. OTA de firmware
-está compilada fuera. La candidate P5.2 solo puede probarse con contraseña y SSID
-de laboratorio no sensibles, URL de update vacía y sin capturar secretos por
-Serial. El canal HTTP, el portal físico abierto y los controles aún pendientes
+está compilada fuera. La candidate actual solo puede probarse con contraseña y
+SSID de laboratorio no sensibles y sin capturar secretos por Serial. El canal
+HTTP, el portal físico abierto y los controles aún pendientes
 impiden tratar esta configuración como un piloto. Flasheo y puerto serie
 requieren aprobaciones separadas.
 

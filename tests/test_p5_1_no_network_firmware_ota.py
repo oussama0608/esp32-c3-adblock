@@ -60,10 +60,13 @@ def test_firmware_source_has_no_network_firmware_ota(
 
 
 def test_http_firmware_update_route_is_absent_but_blocklist_routes_remain() -> None:
-    routes = set(re.findall(r'web\.on\(\s*"([^"]+)"', source_text()))
+    source = source_text()
+    routes = set(re.findall(r'web\.on\(\s*"([^"]+)"', source))
 
     assert "/update" not in routes
-    assert {"/upload", "/fetchnow", "/setupdate"} <= routes
+    assert 'BLOCKLIST_UPLOAD_ROUTE = "/upload"' in source
+    assert "web.addHandler(new BlocklistUploadRequestHandler())" in source
+    assert {"/fetchnow", "/setupdate"}.isdisjoint(routes)
 
 
 def test_dashboard_has_no_firmware_ota_controls() -> None:

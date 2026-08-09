@@ -20,16 +20,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 HASH_BYTES = 5
+MAX_RECORDS = 104_857
 MASK = (1 << (HASH_BYTES * 8)) - 1
 FNV_OFFSET = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
 U64 = (1 << 64) - 1
 
-# 250,000 hashes fit the existing LittleFS budget documented for dual OTA.
-DEFAULT_MAX_OUTPUT_BYTES = 250_000 * HASH_BYTES
+# Keep generated candidates within the firmware's transactional upload budget.
+DEFAULT_MAX_OUTPUT_BYTES = MAX_RECORDS * HASH_BYTES
 HOSTS_SINK_ADDRESSES = frozenset({"0.0.0.0", "127.0.0.1", "::1", "::"})
 
-# Daily driver that fits alongside the existing dual-OTA firmware slots.
+# Retain the reviewed upstream defaults; generation fails closed if their
+# combined result exceeds the transactional candidate cap.
 DEFAULT_SOURCES = (
     "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/light.txt",
@@ -229,6 +231,11 @@ def build_blocklist(
     hash_function: Callable[[bytes], int] | None = None,
 ) -> BuildResult:
     """Build, validate and atomically install a blocklist."""
+    if max_output_bytes > DEFAULT_MAX_OUTPUT_BYTES:
+        raise BlocklistError(
+            "configured output limit exceeds the firmware candidate maximum "
+            f"of {DEFAULT_MAX_OUTPUT_BYTES:,} bytes"
+        )
     source_list = list(sources)
     domains, successful_sources = collect_domains(source_list, reader)
     if successful_sources == 0:

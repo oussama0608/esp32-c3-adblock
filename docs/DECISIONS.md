@@ -283,14 +283,15 @@
 - Verificación local final: 99 tests aprobados (32 de P5.2), Ruff y diff checks
   correctos. PlatformIO enlaza 1.249.513 B (90,8 %) y 51.292 B de RAM (15,7 %).
   El binario físico mide 1.291.104 B, deja 85.152 B (83,16 KiB) y tiene SHA-256
-  `F87A9498C1E182A72E881C9C4BFBEE1AF2F2ACF9694A0B4352F0366278EB5463`. La CI,
-  el navegador y el HIL de esta revisión siguen pendientes; estas medidas no
-  autorizan un flash ni un piloto.
+  `F87A9498C1E182A72E881C9C4BFBEE1AF2F2ACF9694A0B4352F0366278EB5463`. P5.2 y su
+  enmienda P5.2a quedaron committed y pushed en `bbeacda`; una persona confirmó
+  ambos jobs de CI verdes y el HIL completo solicitado. Esa evidencia no elimina
+  el riesgo del canal HTTP ni autoriza un piloto.
 
 ### Enmienda P5.2a — autorización BOOT en runtime
 
 - Fecha: 2026-08-08.
-- Estado: accepted; validación HIL pendiente.
+- Estado: accepted; CI y HIL confirmados en `bbeacda`.
 - Motivo: GPIO9/BOOT es un pin de strapping del ESP32-C3. La doble lectura LOW
   durante `setup()`, separada 60 ms, exigía una secuencia frágil tras liberar
   reset y contradecía las instrucciones que recomendaban mantener BOOT durante
@@ -314,6 +315,90 @@
   enlaza 1.250.561 B de flash y usa 51.332 B de RAM. `firmware.bin` mide
   1.292.272 B, deja 83.984 B físicos y tiene SHA-256
   `534B18024AF53267565C97BAB39A704614172E85C464C146066C6B28483BEEAE`.
-  Frente a P5.2 son +1.048 B enlazados, +40 B RAM y +1.168 B físicos; el margen sigue
-  por encima del gate de 64 KiB. HIL P5.2a permanece pendiente y el build no
-  autoriza flash.
+  Frente a P5.2 son +1.048 B enlazados, +40 B RAM y +1.168 B físicos; el margen
+  sigue por encima del gate de 64 KiB. Una persona confirmó los dos jobs de CI y
+  el HIL completo de esta revisión. Esto valida `bbeacda`, no P5.3a ni un piloto.
+
+## ADR-006 — P5.3a solo local y reemplazo recuperable de blocklist
+
+- Fecha: 2026-08-09.
+- Estado: accepted; validación HIL de cortes pendiente.
+- Contexto: el fetch remoto heredado aceptaba URL configurable, HTTP y TLS con
+  `setInsecure()`, seguía redirects y volvía a resolver el destino sin una
+  defensa SSRF completa. La plataforma fijada permite separar IP de conexión y
+  hostname TLS, pero el bundle CA completo no respeta el margen de flash y la
+  configuración MbedTLS precompilada no comprueba automáticamente la vigencia
+  temporal X.509. Mantener un fetch parcialmente endurecido no cumple el perfil
+  de seguridad de esta entrega.
+- Decisión de alcance: eliminar `/fetchnow`, `/setupdate`, URL, intervalo,
+  scheduler y UI de actualización remota. No sustituirlos por HTTP, TLS inseguro
+  ni una allowlist incompleta. Conservar únicamente `/upload`, protegido por la
+  sesión y CSRF de P5.2, y avisar en español que solo deben usarse archivos de
+  blocklist validados.
+- Archivos: `/blocklist.bin` es la copia activa, `/blocklist.new` el candidato y
+  `/blocklist.old` el rollback temporal. El candidato se escribe y cierra antes
+  de validarlo. Solo una validación completa permite comenzar el reemplazo; un
+  candidato inválido se elimina sin destruir un activo válido. Generador y
+  firmware comparten un máximo de 104.857 registros de cinco bytes: 524.285
+  bytes, dejando espacio para las dos copias necesarias en LittleFS. Un activo o
+  rollback legacy estructuralmente válido puede seguir leyéndose hasta el
+  máximo histórico de 1.250.000 bytes; no se borra para intentar hacer hueco. Si
+  no cabe la candidata junto a él, el upload falla y conserva el activo.
+- Commit transaccional: mover el activo válido a rollback, promover el candidato
+  y revalidar el activo resultante. Un fallo conserva o intenta restaurar la
+  última copia válida. El firmware no interpreta una lista que no haya superado
+  las validaciones de formato y límites.
+- Protocolo HTTP: multipart es el único cuerpo admitido por `/upload`; un
+  dispatcher separa el callback multipart del callback raw compartido por
+  `WebServer` y devuelve 415 para raw/urlencoded sin abrir staging.
+- Orden de arranque: montar LittleFS sin autoformato y ejecutar la recuperación
+  antes de leer el resto del estado o iniciar STA, SoftAP, mDNS, UDP/53 o el
+  servidor HTTP. El montaje o recovery fallidos detienen el arranque sin reboot
+  loop ni servicio de red parcialmente funcional.
+- Recuperación al boot: (A) un activo válido tiene precedencia y limpia
+  candidato/rollback residuales; (B) sin activo válido, un rollback válido se
+  restaura y revalida; (C) sin activo ni rollback válidos, un candidato válido se
+  promueve y revalida; (D) un candidato inválido nunca desplaza un activo válido;
+  (E) sin ninguna copia válida se falla cerrado y no se presenta una lista vacía
+  como actualización correcta.
+- Corte de alimentación: (1) durante upload, el activo gana y se elimina el
+  candidato parcial; (2) después de cerrar el candidato, el activo gana y elimina
+  ese staging todavía no confirmado; (3) después de validarlo pero antes de
+  `active -> old`, el activo también gana; (4) después de `active -> old`, se
+  restaura el rollback válido, salvo que sea inválido y el candidato sea válido;
+  (5) después de `new -> active`, el nuevo activo válido gana; (6) antes de
+  limpiar old, el nuevo activo gana y elimina el rollback residual. Estas
+  propiedades necesitan HIL específico porque los tests host no prueban la
+  durabilidad real de rename/remove en LittleFS.
+- Multipart y concurrencia: el tamaño de fichero se limita por cada chunk a
+  524.285 B. Como filtro temprano, el `Content-Length` del request completo admite
+  4.096 B adicionales de framing (528.381 B en total); un framing o filename
+  excepcionalmente grande puede recibir un 413 conservador. `WebServer` procesa
+  el multipart de forma síncrona. Los guards de parte adicional/transacción
+  huérfana son gates host-estáticos y no prueban desconexión, timeout, cliente
+  lento, recuperación del loop/DNS ni rate limiting en placa.
+- Migración: `/update.cfg` deja de ser configuración activa y desaparece del
+  código de producción. Si una unidad conserva ese archivo legacy, queda inerte:
+  no se abre, interpreta ni usa para habilitar de nuevo el fetch remoto. Puede
+  seguir ocupando LittleFS y reteniendo una URL o token histórico hasta una
+  restauración física; su retirada no forma parte de esta migración automática.
+- Consecuencias: desaparecen la superficie SSRF/TLS/redirect de actualización
+  remota y sus costes de flash. El upload manual sigue siendo una operación
+  administrativa sobre HTTP local y no aporta firma, procedencia ni
+  confidencialidad. Si no queda ninguna copia válida, la recuperación requiere
+  restaurar físicamente por USB una imagen LittleFS conocida y validada; no se
+  ofrece recuperación remota. PILOT continúa **NO-GO**. Una futura
+  reintroducción de fetch requiere otra ADR con política de destinos, resolución
+  fijada, CA, tiempo confiable, redirects manuales, autenticidad y presupuesto
+  medido.
+- Verificación local: 163 tests aprobados y Ruff sin errores. El build terminó
+  `SUCCESS` con 50.684 B de RAM, 1.122.703 B de flash enlazada y 253.553 B de
+  margen enlazado. `firmware.bin` mide 1.160.704 B, deja 215.552 B físicos y su
+  SHA-256 es
+  `D1A24F2D579D6B1617850B07E6FA2A403CBF90E08DDD5DD033475D33B7C34F2C`. Frente a
+  P5.2a reduce 648 B de RAM, 127.858 B enlazados y 131.568 B físicos. Los tres
+  warnings del build indican que, sin Internet, se omitió la comprobación remota
+  de dependencias. `ci_checks repository`, los diff checks y el gate de archivos
+  protegidos pasan localmente. Permanecen pendientes CI real confirmada,
+  multipart en WebServer real, upload/browser HIL y cortes controlados en las
+  seis fronteras; P5.3a no está `CLOSED`.

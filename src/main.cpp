@@ -9,8 +9,6 @@
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
-#include <HTTPClient.h>        // remote blocklist fetch
-#include <WiFiClientSecure.h>  // https fetch
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include <esp_random.h>
@@ -36,8 +34,23 @@ static constexpr const char* WIFI_PASS = "";
 static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
+static const char* BLOCKLIST_NEW_PATH = "/blocklist.new";
+static const char* BLOCKLIST_OLD_PATH = "/blocklist.old";
+static const char* BLOCKLIST_UPLOAD_ROUTE = "/upload";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
+static const uint32_t BLOCKLIST_MAX_RECORDS = 104857;
+static const size_t BLOCKLIST_MAX_BYTES = BLOCKLIST_MAX_RECORDS * HASH_BYTES;
+// Existing P1/P2 blocklists may be larger than the transactional upload limit.
+// Validate and keep those live, but never accept a new upload above the new cap.
+static const uint32_t BLOCKLIST_LEGACY_MAX_RECORDS = 250000;
+static const size_t BLOCKLIST_LEGACY_MAX_BYTES = BLOCKLIST_LEGACY_MAX_RECORDS * HASH_BYTES;
+// Multipart headers/boundaries are not part of the candidate file. This early
+// request gate rejects grossly oversized bodies; the exact file cap is enforced
+// independently for every streamed upload chunk.
+static const size_t BLOCKLIST_MULTIPART_OVERHEAD_MAX = 4096;
+static const size_t BLOCKLIST_UPLOAD_REQUEST_MAX =
+  BLOCKLIST_MAX_BYTES + BLOCKLIST_MULTIPART_OVERHEAD_MAX;
 static const size_t ADMIN_PASSWORD_MIN_LENGTH = 12;
 static const size_t ADMIN_PASSWORD_MAX_LENGTH = 128;
 static const uint8_t ADMIN_VERIFIER_VERSION = 1;
@@ -60,6 +73,10 @@ WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
 uint8_t buf[600];
+bool networkServicesStarted = false;
+bool blocklistHealthy = false;
+
+[[noreturn]] static void enterStorageFailClosed(const char* reason);
 
 struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
 static const int MAX_CLIENTS = 96;
@@ -70,12 +87,6 @@ String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0
 
 static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
-
-// remote blocklist auto-update
-String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
-uint32_t updateIntervalH = 24;      // hours between auto-fetches
-uint32_t lastCheckMs = 0;
-String updateStatus = "never";
 
 // WiFi provisioning (captive portal)
 Preferences prefs;
@@ -446,7 +457,11 @@ static bool inFlash(uint64_t h) {
   int32_t lo = 0, hi = (int32_t)numHashes - 1; uint8_t b[HASH_BYTES];
   while (lo <= hi) {
     int32_t mid = (lo + hi) >> 1;
-    blocklist.seek((uint32_t)mid * HASH_BYTES); blocklist.read(b, HASH_BYTES);
+    if (!blocklist.seek((uint32_t)mid * HASH_BYTES) ||
+        blocklist.read(b, HASH_BYTES) != HASH_BYTES) {
+      blocklistHealthy = false;
+      return false;
+    }
     uint64_t v = 0; for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
     if (v < h) lo = mid + 1; else if (v > h) hi = mid - 1; else return true;
   }
@@ -543,6 +558,7 @@ static int forwardUpstream(int qlen) {
 // Drain a whole RX burst per call (capped, so the web server still gets a turn) instead of
 // one packet per loop iteration. Returns true if any query was handled this call.
 static bool handleDns() {
+  if (!blocklistHealthy) enterStorageFailClosed("runtime blocklist unavailable");
   bool did = false;
   for (int budget = 0; budget < 16; budget++) {
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
@@ -554,6 +570,7 @@ static bool handleDns() {
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
     bool blocked = ban || (dl && numHashes && isBlocked(domain));
+    if (!blocklistHealthy) enterStorageFailClosed("runtime blocklist read failed");
     int rlen;
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen);     totalAllowed++; if (c) c->allowed++; }
@@ -699,7 +716,6 @@ static void handleStats() {
   String j = "{\"csrf\":\"" + csrf + "\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"upurl\":\"" + jsonEscape(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jsonEscape(updateStatus) + "\"" +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
@@ -717,114 +733,496 @@ static void handleBan() {
   web.send(200, "text/plain", "ok");
 }
 
-// ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
-static void reopenBlocklist() {
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
-}
-static void beginBlocklistSwap() {
-  if (blocklist) blocklist.close();
-  numHashes = 0;
-  LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
-}
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
-  reopenBlocklist();
-  return ok;
+// ---------- validated, transactional manual blocklist upload ----------
+enum class BlocklistValidationStatus : uint8_t {
+  VALID,
+  MISSING,
+  OPEN_FAILED,
+  EMPTY,
+  TOO_LARGE,
+  BAD_SIZE,
+  READ_FAILED,
+  DUPLICATE,
+  UNSORTED,
+};
+
+static const char* blocklistValidationToken(BlocklistValidationStatus status) {
+  switch (status) {
+    case BlocklistValidationStatus::VALID: return "valid";
+    case BlocklistValidationStatus::MISSING: return "missing";
+    case BlocklistValidationStatus::OPEN_FAILED: return "open_failed";
+    case BlocklistValidationStatus::EMPTY: return "empty";
+    case BlocklistValidationStatus::TOO_LARGE: return "too_large";
+    case BlocklistValidationStatus::BAD_SIZE: return "bad_size";
+    case BlocklistValidationStatus::READ_FAILED: return "read_failed";
+    case BlocklistValidationStatus::DUPLICATE: return "duplicate";
+    case BlocklistValidationStatus::UNSORTED: return "unsorted";
+  }
+  return "unknown";
 }
 
-// ---------- OTA blocklist update (browser upload) ----------
-static bool upOk = false;
+static uint64_t decodeBlocklistHash(const uint8_t record[HASH_BYTES]) {
+  uint64_t value = 0;
+  for (int i = 0; i < HASH_BYTES; i++) value |= static_cast<uint64_t>(record[i]) << (8 * i);
+  return value;
+}
+
+static BlocklistValidationStatus validateBlocklistFile(
+    const char* path, bool candidateLimits, uint32_t* validatedRecords = nullptr) {
+  if (validatedRecords) *validatedRecords = 0;
+  if (!LittleFS.exists(path)) return BlocklistValidationStatus::MISSING;
+
+  File candidate = LittleFS.open(path, "r");
+  if (!candidate) return BlocklistValidationStatus::OPEN_FAILED;
+  const size_t size = candidate.size();
+  const size_t maxBytes = candidateLimits ? BLOCKLIST_MAX_BYTES : BLOCKLIST_LEGACY_MAX_BYTES;
+  const uint32_t maxRecords = candidateLimits ? BLOCKLIST_MAX_RECORDS : BLOCKLIST_LEGACY_MAX_RECORDS;
+  if (size == 0) {
+    candidate.close();
+    return BlocklistValidationStatus::EMPTY;
+  }
+  if (size > maxBytes) {
+    candidate.close();
+    return BlocklistValidationStatus::TOO_LARGE;
+  }
+  if (size % HASH_BYTES != 0) {
+    candidate.close();
+    return BlocklistValidationStatus::BAD_SIZE;
+  }
+
+  const size_t recordCount = size / HASH_BYTES;
+  if (recordCount == 0 || recordCount > maxRecords) {
+    candidate.close();
+    return BlocklistValidationStatus::TOO_LARGE;
+  }
+
+  static const size_t VALIDATION_RECORDS_PER_READ = 64;
+  uint8_t recordsBuffer[HASH_BYTES * VALIDATION_RECORDS_PER_READ];
+  uint64_t previous = 0;
+  bool havePrevious = false;
+  size_t recordsRead = 0;
+  while (recordsRead < recordCount) {
+    const size_t batchRecords =
+      min(VALIDATION_RECORDS_PER_READ, recordCount - recordsRead);
+    const size_t batchBytes = batchRecords * HASH_BYTES;
+    if (candidate.read(recordsBuffer, batchBytes) != batchBytes) {
+      candidate.close();
+      return BlocklistValidationStatus::READ_FAILED;
+    }
+    for (size_t batchIndex = 0; batchIndex < batchRecords; batchIndex++) {
+      const uint8_t* record = recordsBuffer + batchIndex * HASH_BYTES;
+      const uint64_t current = decodeBlocklistHash(record);
+      if (havePrevious && current == previous) {
+        candidate.close();
+        return BlocklistValidationStatus::DUPLICATE;
+      }
+      if (havePrevious && current <= previous) {
+        candidate.close();
+        return BlocklistValidationStatus::UNSORTED;
+      }
+      previous = current;
+      havePrevious = true;
+    }
+    recordsRead += batchRecords;
+  }
+  if (candidate.available() != 0) {
+    candidate.close();
+    return BlocklistValidationStatus::BAD_SIZE;
+  }
+  candidate.close();
+  if (validatedRecords) *validatedRecords = static_cast<uint32_t>(recordCount);
+  return BlocklistValidationStatus::VALID;
+}
+
+static bool removeBlocklistFile(const char* path) {
+  if (LittleFS.remove(path)) return !LittleFS.exists(path);
+  return !LittleFS.exists(path);
+}
+
+static bool reopenBlocklist() {
+  if (blocklist) blocklist.close();
+  numHashes = 0;
+  blocklistHealthy = false;
+  uint32_t records = 0;
+  if (validateBlocklistFile(BLOCKLIST_PATH, false, &records) !=
+      BlocklistValidationStatus::VALID) return false;
+  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+  if (!blocklist || !blocklist.seek(0)) {
+    if (blocklist) blocklist.close();
+    return false;
+  }
+  numHashes = records;
+  blocklistHealthy = true;
+  return true;
+}
+
+static bool recoverBlocklistFiles() {
+  const BlocklistValidationStatus activeStatus =
+    validateBlocklistFile(BLOCKLIST_PATH, false);
+  const BlocklistValidationStatus oldStatus =
+    validateBlocklistFile(BLOCKLIST_OLD_PATH, false);
+  const BlocklistValidationStatus newStatus =
+    validateBlocklistFile(BLOCKLIST_NEW_PATH, true);
+  Serial.printf("[blocklist] recovery active=%s old=%s candidate=%s\n",
+                blocklistValidationToken(activeStatus),
+                blocklistValidationToken(oldStatus),
+                blocklistValidationToken(newStatus));
+
+  if (activeStatus == BlocklistValidationStatus::VALID) {
+    return removeBlocklistFile(BLOCKLIST_NEW_PATH) &&
+           removeBlocklistFile(BLOCKLIST_OLD_PATH);
+  }
+
+  if (oldStatus == BlocklistValidationStatus::VALID) {
+    if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
+    if (!LittleFS.rename(BLOCKLIST_OLD_PATH, BLOCKLIST_PATH)) return false;
+    if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
+        BlocklistValidationStatus::VALID) {
+      if (LittleFS.exists(BLOCKLIST_PATH) &&
+          !LittleFS.rename(BLOCKLIST_PATH, BLOCKLIST_OLD_PATH)) {
+        Serial.println("[blocklist] rollback recovery rename failed");
+      }
+      return false;
+    }
+    return removeBlocklistFile(BLOCKLIST_NEW_PATH);
+  }
+
+  if (newStatus == BlocklistValidationStatus::VALID) {
+    if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
+    if (!LittleFS.rename(BLOCKLIST_NEW_PATH, BLOCKLIST_PATH)) return false;
+    if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
+        BlocklistValidationStatus::VALID) {
+      if (LittleFS.exists(BLOCKLIST_PATH) &&
+          !LittleFS.rename(BLOCKLIST_PATH, BLOCKLIST_NEW_PATH)) {
+        Serial.println("[blocklist] candidate recovery rename failed");
+      }
+      return false;
+    }
+    return removeBlocklistFile(BLOCKLIST_OLD_PATH);
+  }
+
+  return false;
+}
+
+[[noreturn]] static void enterStorageFailClosed(const char* reason) {
+  if (blocklist) blocklist.close();
+  numHashes = 0;
+  blocklistHealthy = false;
+  if (networkServicesStarted) {
+    dnsServer.stop();
+    upstreamCli.stop();
+    web.stop();
+    MDNS.end();
+    networkServicesStarted = false;
+  }
+  Serial.printf("[fs] %s\n", reason);
+  Serial.println("[fs] DNS/dashboard disabled; USB filesystem recovery required");
+  while (true) delay(1000);
+}
+
+static bool restoreOldBlocklist() {
+  if (blocklist) blocklist.close();
+  numHashes = 0;
+  if (!LittleFS.exists(BLOCKLIST_OLD_PATH)) return false;
+  if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
+  if (!LittleFS.rename(BLOCKLIST_OLD_PATH, BLOCKLIST_PATH)) return false;
+  return reopenBlocklist();
+}
+
+static bool promoteBlocklistCandidate() {
+  uint32_t candidateRecords = 0;
+  if (validateBlocklistFile(BLOCKLIST_NEW_PATH, true, &candidateRecords) !=
+      BlocklistValidationStatus::VALID) return false;
+  if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
+      BlocklistValidationStatus::VALID) {
+    enterStorageFailClosed("active blocklist validation failed");
+  }
+  if (!removeBlocklistFile(BLOCKLIST_OLD_PATH)) return false;
+
+  if (blocklist) blocklist.close();
+  numHashes = 0;
+  if (!LittleFS.rename(BLOCKLIST_PATH, BLOCKLIST_OLD_PATH)) {
+    if (!reopenBlocklist() && !restoreOldBlocklist()) {
+      enterStorageFailClosed("active blocklist reopen failed");
+    }
+    return false;
+  }
+  if (!LittleFS.rename(BLOCKLIST_NEW_PATH, BLOCKLIST_PATH)) {
+    const bool restored = restoreOldBlocklist();
+    removeBlocklistFile(BLOCKLIST_NEW_PATH);
+    if (!restored) enterStorageFailClosed("blocklist rollback failed");
+    return false;
+  }
+  if (!reopenBlocklist() || numHashes != candidateRecords) {
+    if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist rollback failed");
+    return false;
+  }
+  if (!LittleFS.remove(BLOCKLIST_OLD_PATH)) {
+    if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist rollback failed");
+    return false;
+  }
+  return true;
+}
+
+enum class BlocklistUploadStatus : uint8_t {
+  IDLE,
+  RECEIVING,
+  CANDIDATE_READY,
+  SUCCESS,
+  BUSY,
+  TOO_LARGE,
+  STORAGE_ERROR,
+  WRITE_ERROR,
+  INVALID,
+  ABORTED,
+  UNSUPPORTED_MEDIA,
+  PROMOTION_ERROR,
+};
+
 static bool uploadAuthorized = false;
+static bool blocklistTransactionActive = false;
+static bool uploadOwnsTransaction = false;
+static size_t uploadBytesWritten = 0;
+static BlocklistUploadStatus blocklistUploadStatus = BlocklistUploadStatus::IDLE;
 static File upFile;
+
+static bool discardBlocklistCandidate() {
+  if (upFile) upFile.close();
+  return removeBlocklistFile(BLOCKLIST_NEW_PATH);
+}
+
+static void resetBlocklistUploadRequestState() {
+  uploadAuthorized = false;
+  uploadBytesWritten = 0;
+  blocklistUploadStatus = BlocklistUploadStatus::IDLE;
+}
+
+static void failBlocklistUpload(BlocklistUploadStatus status) {
+  if (!uploadOwnsTransaction) {
+    blocklistUploadStatus = status;
+    return;
+  }
+  const bool cleaned = discardBlocklistCandidate();
+  blocklistUploadStatus = cleaned ? status : BlocklistUploadStatus::STORAGE_ERROR;
+  blocklistTransactionActive = false;
+  uploadOwnsTransaction = false;
+}
+
 static void handleUploadDone() {
   if (!requireAdminMutation()) {
-    uploadAuthorized = false;
+    if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::ABORTED);
+    resetBlocklistUploadRequestState();
     return;
   }
   if (!uploadAuthorized) {
-    sendAuthorizationError(403);
+    if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::ABORTED);
+    addSecurityHeaders();
+    web.send(400, "text/plain", "incomplete blocklist upload");
+    resetBlocklistUploadRequestState();
     return;
   }
+
+  if (blocklistUploadStatus == BlocklistUploadStatus::CANDIDATE_READY) {
+    blocklistUploadStatus = promoteBlocklistCandidate()
+      ? BlocklistUploadStatus::SUCCESS
+      : BlocklistUploadStatus::PROMOTION_ERROR;
+    if (blocklistUploadStatus != BlocklistUploadStatus::SUCCESS &&
+        !discardBlocklistCandidate()) {
+      blocklistUploadStatus = BlocklistUploadStatus::STORAGE_ERROR;
+    }
+  }
+  if (uploadOwnsTransaction) {
+    blocklistTransactionActive = false;
+    uploadOwnsTransaction = false;
+  }
+
+  int status = 500;
+  const char* message = "blocklist update failed";
+  switch (blocklistUploadStatus) {
+    case BlocklistUploadStatus::SUCCESS:
+      status = 200; message = "ok"; break;
+    case BlocklistUploadStatus::BUSY:
+      status = 409; message = "blocklist upload busy"; break;
+    case BlocklistUploadStatus::TOO_LARGE:
+      status = 413; message = "blocklist too large"; break;
+    case BlocklistUploadStatus::INVALID:
+      status = 400; message = "invalid blocklist"; break;
+    case BlocklistUploadStatus::ABORTED:
+      status = 400; message = "blocklist upload aborted"; break;
+    case BlocklistUploadStatus::UNSUPPORTED_MEDIA:
+      status = 415; message = "multipart blocklist upload required"; break;
+    case BlocklistUploadStatus::STORAGE_ERROR:
+    case BlocklistUploadStatus::WRITE_ERROR:
+      status = 507; message = "blocklist storage failure"; break;
+    case BlocklistUploadStatus::PROMOTION_ERROR:
+      status = 500; message = "blocklist promotion failed; active retained"; break;
+    case BlocklistUploadStatus::IDLE:
+    case BlocklistUploadStatus::RECEIVING:
+    case BlocklistUploadStatus::CANDIDATE_READY:
+      status = 400; message = "incomplete blocklist upload"; break;
+  }
+  Serial.printf("[blocklist] upload result=%d bytes=%u records=%u\n",
+                status, static_cast<unsigned>(uploadBytesWritten), numHashes);
   addSecurityHeaders();
-  web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
-  uploadAuthorized = false;
+  web.send(status, "text/plain", message);
+  resetBlocklistUploadRequestState();
 }
-static void handleUpload() {
-  HTTPUpload& u = web.upload();
+
+static void handleUpload(HTTPUpload& u) {
   switch (u.status) {
-    case UPLOAD_FILE_START:
-      upOk = false;
+    case UPLOAD_FILE_START: {
       uploadAuthorized = requireAdminMutation(false);
+      if (!uploadAuthorized) {
+        if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::ABORTED);
+        break;
+      }
+      // One multipart request may contain more than one file part. Preserve the
+      // first terminal result and never let a later part restart the request.
+      if (blocklistUploadStatus != BlocklistUploadStatus::IDLE) {
+        if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::BUSY);
+        break;
+      }
+      if (blocklistTransactionActive) {
+        if (uploadOwnsTransaction) {
+          failBlocklistUpload(BlocklistUploadStatus::BUSY);
+        } else {
+          blocklistUploadStatus = BlocklistUploadStatus::BUSY;
+        }
+        break;
+      }
+      uploadBytesWritten = 0;
+      uploadOwnsTransaction = false;
+      blocklistTransactionActive = true;
+      uploadOwnsTransaction = true;
+      const int contentLength = web.clientContentLength();
+      if (contentLength > 0 &&
+          static_cast<size_t>(contentLength) > BLOCKLIST_UPLOAD_REQUEST_MAX) {
+        failBlocklistUpload(BlocklistUploadStatus::TOO_LARGE);
+        break;
+      }
+      if (!removeBlocklistFile(BLOCKLIST_NEW_PATH)) {
+        failBlocklistUpload(BlocklistUploadStatus::STORAGE_ERROR);
+        break;
+      }
+      upFile = LittleFS.open(BLOCKLIST_NEW_PATH, "w");
+      if (!upFile) {
+        failBlocklistUpload(BlocklistUploadStatus::STORAGE_ERROR);
+        break;
+      }
+      blocklistUploadStatus = BlocklistUploadStatus::RECEIVING;
+      Serial.println("[blocklist] receiving manual upload");
+      break;
+    }
+    case UPLOAD_FILE_WRITE: {
+      if (!uploadAuthorized ||
+          blocklistUploadStatus != BlocklistUploadStatus::RECEIVING || !upFile) break;
+      if (u.currentSize > BLOCKLIST_MAX_BYTES - uploadBytesWritten) {
+        failBlocklistUpload(BlocklistUploadStatus::TOO_LARGE);
+        break;
+      }
+      const size_t bytesWritten = upFile.write(u.buf, u.currentSize);
+      if (bytesWritten != u.currentSize) {
+        failBlocklistUpload(BlocklistUploadStatus::WRITE_ERROR);
+        break;
+      }
+      uploadBytesWritten += bytesWritten;
+      break;
+    }
+    case UPLOAD_FILE_END: {
       if (!uploadAuthorized) break;
-      beginBlocklistSwap();
-      upFile = LittleFS.open("/blocklist.new", "w");
-      Serial.println("[ota] receiving blocklist upload");
+      if (blocklistUploadStatus != BlocklistUploadStatus::RECEIVING || !upFile) break;
+      upFile.flush();
+      upFile.close();
+      if (uploadBytesWritten > BLOCKLIST_MAX_BYTES ||
+          u.totalSize != uploadBytesWritten) {
+        failBlocklistUpload(BlocklistUploadStatus::TOO_LARGE);
+        break;
+      }
+      const BlocklistValidationStatus validation =
+        validateBlocklistFile(BLOCKLIST_NEW_PATH, true);
+      if (validation != BlocklistValidationStatus::VALID) {
+        Serial.printf("[blocklist] candidate rejected=%s\n",
+                      blocklistValidationToken(validation));
+        failBlocklistUpload(BlocklistUploadStatus::INVALID);
+        break;
+      }
+      blocklistUploadStatus = BlocklistUploadStatus::CANDIDATE_READY;
       break;
-    case UPLOAD_FILE_WRITE:
-      if (uploadAuthorized && upFile) upFile.write(u.buf, u.currentSize);
-      break;
-    case UPLOAD_FILE_END:
-      if (!uploadAuthorized) break;
-      if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
-      Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
-      break;
+    }
     case UPLOAD_FILE_ABORTED:
       if (!uploadAuthorized) break;
+      if (!uploadOwnsTransaction) break;
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
-      Serial.println("[ota] aborted");
-      uploadAuthorized = false;
+      if (!LittleFS.remove(BLOCKLIST_NEW_PATH) &&
+          LittleFS.exists(BLOCKLIST_NEW_PATH)) {
+        blocklistUploadStatus = BlocklistUploadStatus::STORAGE_ERROR;
+      } else {
+        blocklistUploadStatus = BlocklistUploadStatus::ABORTED;
+      }
+      blocklistTransactionActive = false;
+      uploadOwnsTransaction = false;
+      Serial.println("[blocklist] upload aborted; active retained");
       break;
   }
 }
 
-// ---------- remote blocklist auto-update ----------
-static void loadUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
-  updateUrl = f.readStringUntil('\n'); updateUrl.trim();
-  String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
-  f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
-}
-static void saveUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.close();
-}
-static bool fetchBlocklist(String url) {
-  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
-  Serial.println("[remote] GET configured blocklist URL");
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
-  WiFiClient cl;
-  HTTPClient http; http.setTimeout(20000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
-  bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
-  beginBlocklistSwap();
-  File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
-  WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
-  while (http.connected() && (len < 0 || (int)total < len)) {
-    size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
-    else { if (millis() - idle > 15000) break; delay(2); }
+static void handleUnsupportedUpload(HTTPRaw& raw) {
+  if (raw.status != RAW_START) return;
+  uploadAuthorized = requireAdminMutation(false);
+  if (!uploadAuthorized) return;
+  if (blocklistTransactionActive && uploadOwnsTransaction) {
+    failBlocklistUpload(BlocklistUploadStatus::BUSY);
+  } else {
+    blocklistUploadStatus = BlocklistUploadStatus::UNSUPPORTED_MEDIA;
   }
-  f.close(); http.end();
-  bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
-  Serial.printf("[remote] %s\n", updateStatus.c_str());
-  return ok;
+}
+
+class BlocklistUploadRequestHandler final : public RequestHandler {
+ public:
+  bool canHandle(WebServer& server, HTTPMethod method, const String& uri) override {
+    (void)server;
+    return method == HTTP_POST && uri == BLOCKLIST_UPLOAD_ROUTE;
+  }
+
+  bool canUpload(WebServer& server, const String& uri) override {
+    return server.method() == HTTP_POST && uri == BLOCKLIST_UPLOAD_ROUTE;
+  }
+
+  bool canRaw(WebServer& server, const String& uri) override {
+    return server.method() == HTTP_POST && uri == BLOCKLIST_UPLOAD_ROUTE;
+  }
+
+  bool handle(WebServer& server, HTTPMethod method, const String& uri) override {
+    if (!canHandle(server, method, uri)) return false;
+    handleUploadDone();
+    return true;
+  }
+
+  void upload(WebServer& server, const String& uri, HTTPUpload& upload) override {
+    (void)server;
+    (void)uri;
+    handleUpload(upload);
+  }
+
+  void raw(WebServer& server, const String& uri, HTTPRaw& raw) override {
+    (void)server;
+    (void)uri;
+    handleUnsupportedUpload(raw);
+  }
+};
+
+static void cleanupOrphanedBlocklistUpload() {
+  // In the pinned synchronous WebServer, a multipart request is parsed entirely
+  // inside handleClient(). A live transaction here means parsing returned on an
+  // error path without UPLOAD_FILE_ABORTED or the final route handler.
+  if (!blocklistTransactionActive &&
+      blocklistUploadStatus == BlocklistUploadStatus::IDLE) return;
+  const bool cleaned = discardBlocklistCandidate();
+  blocklistTransactionActive = false;
+  uploadOwnsTransaction = false;
+  resetBlocklistUploadRequestState();
+  Serial.printf("[blocklist] orphaned upload discarded=%s; active retained\n",
+                cleaned ? "true" : "false");
 }
 
 // ---------- WiFi provisioning (captive portal) ----------
@@ -1083,25 +1481,6 @@ static void handleForgetWifi() {
   ESP.restart();
 }
 
-static void handleFetchNow() {
-  if (!requireAdminMutation()) return;
-  fetchBlocklist(updateUrl);
-  addSecurityHeaders();
-  web.send(200, "text/plain", updateStatus);
-}
-
-static void handleSetUpdate() {
-  if (!requireAdminMutation()) return;
-  if (web.hasArg("u")) updateUrl = web.arg("u");
-  if (web.hasArg("h")) {
-    updateIntervalH = web.arg("h").toInt();
-    if (updateIntervalH < 1) updateIntervalH = 1;
-  }
-  saveUpdateCfg();
-  addSecurityHeaders();
-  web.send(200, "text/plain", "ok");
-}
-
 static void handleNotFound() {
   if (!requireAllowedAdminHost()) return;
   addSecurityHeaders();
@@ -1119,10 +1498,11 @@ void setup() {
   static const char* REQUEST_HEADERS[] = {"Host", "Cookie", "X-CSRF-Token"};
   web.collectHeaders(REQUEST_HEADERS, sizeof(REQUEST_HEADERS) / sizeof(REQUEST_HEADERS[0]));
 
-  if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
-  loadCustom(); loadBanned(); loadUpdateCfg();
+  if (!LittleFS.begin(false)) enterStorageFailClosed("LittleFS mount failed");
+  if (!recoverBlocklistFiles()) enterStorageFailClosed("blocklist recovery failed");
+  if (!reopenBlocklist()) enterStorageFailClosed("active blocklist load failed");
+  Serial.printf("blocklist: %u domains\n", numHashes);
+  loadCustom(); loadBanned();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // An admin verifier must exist before provisioned or compile-time WiFi can
@@ -1143,22 +1523,17 @@ void setup() {
   web.on("/addblock", HTTP_POST, handleAddBlock);
   web.on("/unblock", HTTP_POST, handleUnblock);
   web.on("/forgetwifi", HTTP_POST, handleForgetWifi);
-  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
-  web.on("/fetchnow", HTTP_POST, handleFetchNow);
-  web.on("/setupdate", HTTP_POST, handleSetUpdate);
+  web.addHandler(new BlocklistUploadRequestHandler());  // validated blocklist data only
   web.onNotFound(handleNotFound);
   web.begin();
+  networkServicesStarted = true;
   Serial.println("DNS :53 + dashboard :80 up");
 }
 
 void loop() {
   web.handleClient();
+  cleanupOrphanedBlocklistUpload();
   bool busy = handleDns();
   handleRuntimeBootRecovery();
-  if (updateUrl.length()) {               // periodic remote blocklist auto-update
-    uint32_t now = millis();
-    if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
-    else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
-  }
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
 }
