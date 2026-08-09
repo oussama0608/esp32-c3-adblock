@@ -231,6 +231,63 @@ dependencias; no fueron errores de compilación. `ci_checks repository`, ambos
 diff checks y el gate de archivos protegidos pasan localmente. La CI real y todo
 HIL P5.3a siguen pendientes.
 
+## P5.4 — reintento STA acotado
+
+P5.4 conserva el preflight STA y el workaround RF validados, pero evita caer al
+portal de provisioning tras un único plazo de asociación transitorio. Antes de
+cualquier inicialización Wi-Fi, tanto en el camino STA como en el portal por
+ausencia de verificador administrativo, configura una sola vez
+`WiFi.persistent(false)`. Esta llamada selecciona almacenamiento RAM para la
+configuración interna del core Arduino durante el boot; no borra ni reescribe
+las credenciales de aplicación guardadas en Preferences.
+
+Los gates automatizados de esta entrega deben cubrir:
+
+- preflight ejecutado una sola vez y en el orden existente:
+  `WiFi.mode(WIFI_STA)`, `WiFi.setSleep(false)`, espera acotada de
+  `WiFi.STA.started()` y `applyC3RfWorkaround()`;
+- una sola llamada con credenciales a `WiFi.begin(ssid, pass)` y limpieza
+  inmediata de la copia local de la contraseña;
+- primera ventana de asociación de 20.000 ms y retorno inmediato sin reconnect
+  cuando alcanza `WL_CONNECTED`;
+- tras el primer timeout, un `WiFi.disconnect(false, false, 100)` comprobado,
+  espera de 250 ms y como máximo una llamada a `WiFi.reconnect()`;
+- fallo del primer disconnect sin reconnect, y fallo de `WiFi.reconnect()` sin
+  abrir una segunda ventana;
+- si reconnect arranca, una sola segunda ventana de 20.000 ms; su timeout hace
+  un disconnect final comprobado, espera 250 ms y devuelve el control al mismo
+  fallback de portal;
+- constantes explícitas `WIFI_ASSOCIATION_TIMEOUT_MS = 20000`,
+  `WIFI_DISCONNECT_TIMEOUT_MS = 100` y `WIFI_RETRY_SETTLE_MS = 250`, con
+  resta wrap-safe de `millis()`;
+- máximo de dos ventanas, ausencia de recursión o bucles de reconnect no
+  acotados y conteos máximos de un `WiFi.begin` y un `WiFi.reconnect`;
+- ausencia de retry cuando faltan credenciales o fallan modo STA, arranque STA o
+  workaround RF;
+- ausencia de nuevas escrituras persistentes, logging de credenciales, eventos
+  Wi-Fi, política por reason code, reinicio o ciclo adicional de `WIFI_STA`;
+- invariantes de BOOT, autenticación, blocklist, OTA ausente y archivos
+  protegidos sin cambios.
+
+El peor caso configurado de la secuencia de asociación es 40.700 ms: dos
+ventanas de 20.000 ms, dos timeouts de disconnect de hasta 100 ms y dos esperas
+de 250 ms. A esto se suma la espera preexistente de hasta 1.000 ms para que STA
+arranque y el pequeño overshoot del polling. El core Arduino puede efectuar
+reintentos internos durante cada ventana; P5.4 acota las acciones adicionales de
+la aplicación, no el número de tramas RF internas.
+
+La validación local pasa con 173 tests, Ruff, `ci_checks repository`, ambos diff
+checks, archivos protegidos y build PlatformIO. El build usa 50.684 bytes de RAM
+y 1.123.177 bytes de flash enlazada; `firmware.bin` mide 1.161.360 bytes, deja
+214.896 bytes físicos y tiene SHA-256
+`81BD51E0582A34F206CC08FB4A2F8643DC3999062B4C611B67AE0831C7226A97`.
+
+Quedan pendientes la CI real y el HIL específico: conexión en la primera
+ventana; hotspot disponible solo durante la segunda; dos timeouts con aparición
+del mismo portal; reinicio posterior sin reprovisioning; y regresión de BOOT,
+login, dashboard, DNS permitido/bloqueado y upload manual. Hasta entonces P5.4
+no acredita hardware ni autoriza PILOT.
+
 ## Integración continua — implementado en P3
 
 `.github/workflows/ci.yml` valida los pushes y pull requests dirigidos a `main`

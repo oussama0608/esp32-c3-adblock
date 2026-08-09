@@ -402,3 +402,63 @@
   protegidos pasan localmente. Permanecen pendientes CI real confirmada,
   multipart en WebServer real, upload/browser HIL y cortes controlados en las
   seis fronteras; P5.3a no está `CLOSED`.
+
+## ADR-007 — P5.4 reintento STA acotado antes del portal
+
+- Fecha: 2026-08-09.
+- Estado: accepted; validación local completada, HIL pendiente.
+- Contexto: el HIL de P5.3a observó un boot que agotó los 20 segundos de
+  asociación y cayó al portal, seguido de otro boot que conectó correctamente al
+  mismo hotspot. El marcador RTC descartó un fallo determinista de montaje,
+  recuperación, blocklist, verificador o preflight STA. El core Arduino ya puede
+  reintentar internamente ciertos fallos transitorios, pero al vencer el plazo la
+  aplicación cambia inmediatamente a AP y ya no permite que STA se recupere.
+- Persistencia del core: llamar exactamente una vez a `WiFi.persistent(false)`
+  antes de cualquier inicialización Wi-Fi, incluido el camino de portal por
+  verificador ausente. La configuración interna del driver queda en RAM durante
+  ese boot. Esta decisión no borra, sustituye ni escribe las credenciales que la
+  aplicación conserva en Preferences.
+- Preflight: mantener una sola activación `WIFI_STA`, `setSleep(false)`, espera
+  acotada de `STA.started()` y aplicación del límite RF de 8,5 dBm. Si falta un
+  SSID usable o falla modo, arranque STA o RF, no se intenta reconnect y se
+  conserva el fallback existente.
+- Primera ventana: conservar una única llamada con credenciales a
+  `WiFi.begin(ssid, pass)`, limpiar inmediatamente la copia local de la
+  contraseña y esperar hasta 20.000 ms con resta wrap-safe de `millis()`. El
+  éxito devuelve `true` inmediatamente.
+- Reintento B+C: tras el primer timeout, comprobar
+  `WiFi.disconnect(false, false, 100)`. Si falla, no llamar reconnect y devolver
+  `false` al portal sin cambiar su lógica. Si tiene éxito, esperar 250 ms,
+  comprobar una única llamada a `WiFi.reconnect()` y, solo si arranca, abrir una
+  segunda ventana de 20.000 ms. Un segundo timeout ejecuta un disconnect final
+  comprobado, espera otros 250 ms y devuelve `false` al mismo portal.
+- Acotación: la aplicación ejecuta como máximo un `WiFi.begin`, un
+  `WiFi.reconnect()` y dos ventanas. El peor caso configurado es 40.700 ms, más
+  la espera previa existente de hasta 1.000 ms para arrancar STA y el overshoot
+  del polling. No se añaden recursión, bucle infinito de reconnect, callback de
+  eventos, política por reason code, reboot ni ciclo de modo STA.
+- Alternativas: repetir `WiFi.begin()` duplicaría configuración y podría
+  competir con el core; ciclar `WIFI_STA` altera más estado y exigiría reaplicar
+  RF; un reboot necesita estado adicional para evitar loops; y una decisión por
+  eventos/reason introduce concurrencia sin evidencia suficiente. No se adopta
+  reconnect continuo en background.
+- Consecuencias: un fallo transitorio obtiene una segunda oportunidad acotada
+  antes del portal. Credenciales erróneas o un SSID ausente pueden demorar el
+  fallback aproximadamente otros 20,7 segundos. Los reintentos internos del core
+  siguen siendo dependientes de su versión y motivo; esta ADR solo acota las
+  llamadas adicionales de la aplicación. Portal, BOOT, autenticación, blocklist,
+  DNS y ausencia de OTA no cambian. PILOT continúa **NO-GO**.
+- Verificación requerida: tests de éxito en primera y segunda ventana, doble
+  timeout, fallos de disconnect/reconnect y preflight, conteos exactos de
+  begin/reconnect/RF, tiempos constantes, ausencia de persistencia/escrituras y
+  regresiones P5.1–P5.3a. Después del build debe medirse RAM, flash enlazada,
+  tamaño físico y hash. El HIL debe cubrir hotspot disponible en cada ventana,
+  fallback tras doble timeout, reboot sin reprovisioning y regresión de BOOT,
+  login, dashboard, DNS y upload manual.
+- Validación local: `pytest -q` pasa con 173 tests, Ruff y `ci_checks repository`
+  pasan, los diff checks están limpios y `partitions.csv`, `LICENSE` y
+  `platformio.ini` permanecen intactos. PlatformIO termina `SUCCESS`: RAM
+  50.684 bytes, flash enlazada 1.123.177 bytes, `firmware.bin` 1.161.360 bytes,
+  margen físico 214.896 bytes y SHA-256
+  `81BD51E0582A34F206CC08FB4A2F8643DC3999062B4C611B67AE0831C7226A97`.
+  Esto no sustituye CI real ni HIL.

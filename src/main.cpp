@@ -66,6 +66,9 @@ static const uint8_t BOOT_BUTTON_PIN = 9;
 static const uint32_t PORTAL_BOOT_HOLD_MS = 3000;
 static const uint32_t RUNTIME_BOOT_HOLD_MS = 5000;
 static const uint32_t BOOT_RELEASE_STABLE_MS = 60;
+static const uint32_t WIFI_ASSOCIATION_TIMEOUT_MS = 20000;
+static const uint32_t WIFI_DISCONNECT_TIMEOUT_MS = 100;
+static const uint32_t WIFI_RETRY_SETTLE_MS = 250;
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
@@ -133,6 +136,17 @@ struct AdminVerifierRecord {
 // Limit TX power to 8.5 dBm for stable AP/STA operation.
 static bool applyC3RfWorkaround() {
   return WiFi.setTxPower(WIFI_POWER_8_5dBm);
+}
+
+static bool waitForWiFiAssociation() {
+  const uint32_t startedAtMs = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startedAtMs < WIFI_ASSOCIATION_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
 }
 
 static bool bootHoldReached(BootHoldState& state, uint32_t thresholdMs) {
@@ -1320,10 +1334,31 @@ static bool connectWiFi() {
   }
   WiFi.begin(ssid, pass);
   clearSensitiveString(pw);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(250); Serial.print("."); }
-  Serial.println();
-  return WiFi.status() == WL_CONNECTED;
+  if (waitForWiFiAssociation()) return true;
+
+  Serial.println("[wifi] first association window timed out; retrying once");
+  const bool disconnectedForRetry =
+    WiFi.disconnect(false, false, WIFI_DISCONNECT_TIMEOUT_MS);
+  if (!disconnectedForRetry) {
+    Serial.println("[wifi] disconnect did not settle within retry timeout");
+    delay(WIFI_RETRY_SETTLE_MS);
+    return false;
+  }
+  delay(WIFI_RETRY_SETTLE_MS);
+
+  if (!WiFi.reconnect()) {
+    Serial.println("[wifi] reconnect request failed");
+    return false;
+  }
+  if (waitForWiFiAssociation()) return true;
+
+  const bool finalDisconnectOk =
+    WiFi.disconnect(false, false, WIFI_DISCONNECT_TIMEOUT_MS);
+  if (!finalDisconnectOk) {
+    Serial.println("[wifi] failed to quiesce STA after final timeout");
+  }
+  delay(WIFI_RETRY_SETTLE_MS);
+  return false;
 }
 
 static void handlePortalRoot() {
@@ -1504,6 +1539,10 @@ void setup() {
   Serial.printf("blocklist: %u domains\n", numHashes);
   loadCustom(); loadBanned();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+
+  // Keep Arduino driver configuration RAM-only; application Preferences and
+  // the optional compile-time fallback remain the only credential sources.
+  WiFi.persistent(false);
 
   // An admin verifier must exist before provisioned or compile-time WiFi can
   // bypass the physically authorized setup portal.

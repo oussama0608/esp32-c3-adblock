@@ -184,7 +184,7 @@ def test_c3_rf_workaround_is_minimal_and_has_two_call_sites() -> None:
     assert not [change for change in forbidden_rf_changes if change in source]
 
 
-def test_sta_rf_workaround_precedes_the_only_association_attempt() -> None:
+def test_sta_rf_workaround_precedes_the_only_credential_bearing_begin() -> None:
     source = (REPO_ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
     connect = source.split("static bool connectWiFi()", 1)[1].split(
         "static void handlePortalRoot", 1
@@ -196,13 +196,10 @@ def test_sta_rf_workaround_precedes_the_only_association_attempt() -> None:
     ]
     helper_index = connect.index("applyC3RfWorkaround()")
     begin_index = connect.index("WiFi.begin(ssid, pass)")
-    timeout_index = connect.index(
-        "while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000)"
-    )
 
     assert len(started_checks) >= 2
     assert mode_index < min(started_checks) < max(started_checks)
-    assert max(started_checks) < helper_index < begin_index < timeout_index
+    assert max(started_checks) < helper_index < begin_index
     start_guard = re.search(
         r"if\s*\(\s*!staModeOk\s*\|\|\s*!WiFi\.STA\.started\(\)\s*\)\s*"
         r"\{.*?return false;\s*\}",
