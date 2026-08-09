@@ -265,6 +265,37 @@ estáticos. Después de validar la revisión exacta, las seis candidatas directa
 pueden pasar a `MITIGATED`, nunca a `CLOSED` sin browser/HIL y sin cumplir sus
 condiciones completas.
 
+### Delta P5.5 — procedencia firmada del upload manual
+
+P5.5 conserva el formato activo y la ausencia de fetch remoto. Cada nuevo
+`POST /upload` requiere un proof de 128 bytes firmado con ECDSA P-256/SHA-256
+por la única clave pública autorizada (Key ID `2173599637`, List ID `1`). Host,
+sesión y CSRF se comprueban antes del proof; un proof ausente, malformado o no
+autorizado falla antes de crear `/blocklist.new`.
+
+El manifest autentica secuencia no nula, tamaño, recuento y SHA-256 del payload.
+El firmware comprueba la firma al iniciar el upload, después valida los bytes
+persistidos y vuelve a autenticar el active tras los renames. El proof temporal
+`/blocklist.new.auth` se conserva hasta confirmar el nuevo active; se retira
+mientras old todavía permite rollback y old se elimina al final. En recuperación,
+un candidato sin proof nunca gana y el estado active+proof sin candidate se trata
+como marcador de promoción interrumpida.
+
+Esto reduce la posibilidad de que una sesión administrativa comprometida instale
+una política arbitraria, pero no elimina el riesgo del canal HTTP ni el DoS de
+upload. Las listas active/old legacy unsigned continúan siendo boot-compatibles,
+V1 permite replay de releases correctamente firmadas y no conserva attestation
+del active en reposo. TM-06 y TM-13 siguen como máximo candidatas a `MITIGATED`
+hasta CI, multipart real y HIL de cortes; no pasan a `CLOSED`.
+
+Validación local P5.5: 231 tests, Ruff, `ci_checks repository`, diff checks y
+archivos protegidos correctos. PlatformIO `SUCCESS`: 50.828 B RAM,
+1.127.265 B enlazados, margen enlazado 248.991 B y `firmware.bin` de 1.165.808 B
+con 210.448 B físicos libres. Su SHA-256 es
+`67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
+Frente a P5.4 aumenta 144 B RAM, 4.088 B enlazados y 4.448 B físicos. CI real y
+HIL siguen pendientes.
+
 ## Registro detallado
 
 ### TM-01 — Plano administrativo HTTP expuesto
@@ -421,7 +452,7 @@ condiciones completas.
 ### TM-06 — Sustitución destructiva mediante `/upload`
 
 - **ID:** TM-06.
-- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; el algoritmo destructivo
+- **Estado P5.5:** candidata a `MITIGATED`, no `CLOSED`; el algoritmo destructivo
   descrito debajo es histórico y faltan CI/multipart/power-loss HIL.
 - **Activo afectado:** blocklist, LittleFS, disponibilidad y política DNS.
 - **Atacante requerido:** cliente LAN o navegador capaz de enviar un formulario
@@ -437,14 +468,17 @@ condiciones completas.
   política persistente.
 - **Probabilidad:** Alta.
 - **Severidad:** HIGH.
-- **Controles actuales P5.3a:** sesión/CSRF se revalidan antes de escribir y antes
+- **Controles actuales P5.5:** sesión/CSRF se revalidan antes de escribir y antes
   de promocionar; límite streamed, writes comprobados, validador acotado,
   active/new/old, rollback y boot recovery conservan last-known-good. Un
   dispatcher alineado con el parser del core solo accede a `web.upload()` para
-  multipart y rechaza raw/urlencoded con 415 sin persistir bytes.
-- **Controles ausentes:** autenticidad/firma, prueba HTTP multipart real, timeout
-  y rate limit; short write, filesystem lleno, fallos de rename y cortes solo se
-  modelan/inspeccionan hasta completar HIL.
+  multipart y rechaza raw/urlencoded con 415 sin persistir bytes. P5.5 exige un
+  proof firmado antes de abrir staging, vincula manifest y payload persistido y
+  solo recupera un candidato acompañado por autenticación válida.
+- **Controles ausentes:** anti-replay, attestation de listas active/legacy,
+  prueba HTTP multipart real, timeout y rate limit; short write, filesystem
+  lleno, fallos de rename y cortes solo se modelan/inspeccionan hasta completar
+  HIL.
 - **Corrección propuesta:** mantener el upload fuera de PILOT hasta completar el
   HIL multipart/LittleFS, la autenticidad del artefacto y los límites de tasa; no
   volver al swap destructivo ni ampliar el máximo para forzar que una lista quepa.
@@ -657,9 +691,9 @@ condiciones completas.
 ### TM-13 — Blocklist no transaccional ni validada
 
 - **ID:** TM-13.
-- **Estado P5.3a:** candidata a `MITIGATED`, no `CLOSED`; el swap destructivo
-  descrito debajo es histórico y la transacción/recovery necesita HIL de fallos y
-  cortes reales.
+- **Estado P5.5:** candidata a `MITIGATED`, no `CLOSED`; el swap destructivo
+  descrito debajo es histórico y la transacción autenticada/recovery necesita HIL
+  de fallos y cortes reales.
 - **Activo afectado:** integridad, autenticidad y disponibilidad de la blocklist.
 - **Atacante requerido:** cliente LAN, servidor remoto o fallo de I/O/potencia.
 - **Superficie histórica:** `beginBlocklistSwap()`, `commitNewBlocklist()` y el
@@ -673,11 +707,13 @@ condiciones completas.
   negativos, corrupción y pérdida de bloqueo tras cualquier fallo.
 - **Probabilidad:** Alta porque ocurre en cada update y hay rutas no autenticadas.
 - **Severidad:** HIGH.
-- **Controles actuales P5.3a:** validador streaming acotado, límite 524.285 B,
+- **Controles actuales P5.5:** validador streaming acotado, límite 524.285 B,
   orden estricto/unicidad, writes completos, active/new/old, rollback comprobado,
-  reapertura/revalidación y recovery determinista antes de red.
-- **Controles ausentes:** digest/firma/procedencia, journaling/durabilidad
-  garantizada, fault injection C++ real, multipart en WebServer y power-cut HIL.
+  reapertura/revalidación y recovery determinista antes de red. El proof ECDSA
+  autentica metadata y SHA-256 en ingreso y se mantiene hasta confirmar el active.
+- **Controles ausentes:** anti-replay y attestation permanente de active/legacy,
+  journaling/durabilidad garantizada, fault injection C++ real, multipart en
+  WebServer y power-cut HIL.
 - **Corrección propuesta:** validar en streaming a un staging que quepa, cerrar y
   verificar antes de commit, conservar la lista activa y recuperar anterior o
   nueva tras reinicio. Si no caben dos copias, rechazar sin tocar la viva o
@@ -1299,7 +1335,8 @@ el rate limiting general.
 | **P5.2** | Panel combinado: encoding/DOM, PBKDF2, BOOT, sesión, POST+CSRF, Host, headers y throttle login | TM-01, TM-02, TM-16 a TM-20 | Host/build y después browser/HIL; HTTP claro mantiene PILOT en NO-GO. |
 | **P5.3/P5.4 originales** | Absorbidos por P5.2 para controles de código; quedan canal, interfaz, Origin/reautenticación y rate limit general | TM-01, TM-17 a TM-20, TM-28 | No se declaran completos por añadir auth sobre HTTP. |
 | **P5.3a** | C parcial: blocklist manual last-known-good, límites, validación, recovery y fetch eliminado | TM-06, TM-08, TM-12 a TM-15, TM-25 | Implementado localmente; upload sigue fuera de PILOT hasta CI/HIL, autenticidad y capacidad real. |
-| **P5.6** | D: HTTPS verificado, autenticidad de artefacto y política SSRF | TM-08, TM-14, TM-15 | Fetch remoto sigue compilado fuera si el coste/ciclo CA no es aceptable. |
+| **P5.5** | Procedencia ECDSA para nuevos uploads, proof temporal y recovery autenticado | TM-06, TM-13 | V1 mantiene replay y listas legacy unsigned; requiere CI y HIL multipart/power-cut y no resuelve HTTP claro. |
+| **P5.6** | D: transporte HTTPS verificado, redirects y política SSRF; la firma P5.5 seguiría siendo obligatoria | TM-08, TM-14, TM-15 | Fetch remoto sigue compilado fuera si el coste/ciclo CA no es aceptable. |
 | **P5.7** | Portal físico/temporal, NVS/FS endurecidos, reconexión y recovery probado | TM-10 a TM-12, TM-24, TM-25, TM-30 | Bloqueante de PILOT. |
 | **P5.8** | Parser DNS, asociación upstream, cuotas y presupuesto de heap | TM-20 a TM-23 | Bloqueante de PILOT y requiere fuzz/HIL. |
 | **P5.9** | Firma, boot confirmation y anti-downgrade si se decide reabrir OTA | TM-26, TM-27 | Opcional para PILOT solo si OTA permanece ausente; obligatorio para reactivarla. |
@@ -1319,9 +1356,9 @@ Utilizable únicamente en nuestra LAN de pruebas:
 - sin port-forward, DMZ, relay cloud ni administración WAN; el firmware no
   cambia router, DNS, DHCP ni Wi-Fi;
 - OTA de firmware siempre compilada fuera después de P5.1;
-- upload manual de blocklist solo detrás de auth/CSRF y ejercitado en pruebas
-  deliberadas; fetch, URL e intervalo remotos están ausentes. El upload no está
-  permitido en PILOT;
+- upload manual de blocklist solo detrás de auth/CSRF, con proof de la autoridad
+  aprobada y ejercitado en pruebas deliberadas; fetch, URL e intervalo remotos
+  están ausentes. El upload no está permitido en PILOT;
 - antes de P5.10, solo SSID de laboratorio deliberadamente no sensible; nunca
   password, token, QNAME ni bypass;
 - assertions y nombre de perfil visibles para impedir confundirlo con PILOT;
@@ -1341,8 +1378,9 @@ Mínimo antes de instalarlo a otra persona:
 - la candidate P5.2 autentica y protege de CSRF/rebinding a nivel de aplicación,
   pero administración permanece ausente/read-only para PILOT hasta proteger el
   canal y pasar browser/HIL;
-- upload manual ausente/read-only para PILOT hasta completar autenticidad y HIL
-  transaccional; fetch remoto permanece compilado fuera sin fecha de reapertura;
+- upload manual ausente/read-only para PILOT hasta completar CI, HIL
+  transaccional y una decisión explícita sobre replay/legacy; fetch remoto
+  permanece compilado fuera sin fecha de reapertura;
 - una administración sobre HTTP claro no se aprueba solo por añadir password:
   debe estar ausente/limitada a una ventana física o usar un canal que proteja
   credencial y sesión; aceptar HTTP deja un HIGH residual explícito;
@@ -1395,7 +1433,7 @@ Mínimo antes de instalarlo a otra persona:
 | P5.1 `dce4672` medido | 1.274.960/1.376.256 B; 101.296 B libres; 1.234.851 B enlazados | 51.164/327.680 B; ahorro dinámico no medido |
 | P5.2 combinado, medido localmente | 1.291.104/1.376.256 B físicos; 85.152 B (83,16 KiB) libres; 1.249.513 B enlazados | 51.292/327.680 B estáticos; pico PBKDF2 aún debe medirse en HIL |
 | P5.3a manual-only, medido localmente | 1.160.704/1.376.256 B físicos; 215.552 B libres; 1.122.703 B enlazados | 50.684/327.680 B estáticos; heap dinámico pendiente de HIL |
-| P5.5 C | +2 a +10 KiB estimados | <1 KiB si la validación es streaming; exige espacio flash de staging |
+| P5.5 procedencia de blocklist, medido localmente | 1.165.808/1.376.256 B físicos; 210.448 B libres; 1.127.265 B enlazados | 50.828/327.680 B estáticos; pico ECDSA/FS pendiente de HIL |
 | P5.6 D | transporte +2 a +15 KiB con CA mínima; sección bundle 68.987 B, delta real y coste firma desconocidos | pico dinámico TLS no medido hasta HIL |
 
 No se inventa todavía un límite comercial adicional al slot físico. Cada parche

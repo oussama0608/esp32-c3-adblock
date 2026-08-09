@@ -288,6 +288,61 @@ del mismo portal; reinicio posterior sin reprovisioning; y regresión de BOOT,
 login, dashboard, DNS permitido/bloqueado y upload manual. Hasta entonces P5.4
 no acredita hardware ni autoriza PILOT.
 
+## P5.5 — procedencia firmada de blocklists manuales
+
+P5.5 mantiene intacto el formato activo de registros de cinco bytes y exige para
+cada nuevo upload HTTP una prueba separada de 128 bytes. El navegador envía solo
+`blocklist.bin` como parte multipart y codifica `blocklist.sig` como 256 dígitos
+hexadecimales en `X-Blocklist-Proof`. El firmware valida el envelope y ECDSA
+P-256/SHA-256 antes de abrir `/blocklist.new`, y vuelve a comprobar tamaño,
+recuento y SHA-256 contra los bytes persistidos antes y después de promocionarlos.
+
+Los tests permanentes de esta entrega cubren:
+
+- layout exacto del manifest/proof, dominio firmado, little-endian y tabla de
+  confianza con una única clave pública de producción, Key ID `2173599637` y
+  List ID `1`;
+- firma válida y rechazos por firma o payload alterados, proof truncado/hex
+  malformado, clave desconocida, list ID, versión, algoritmo, flags, secuencia
+  cero, longitud, count, SHA y valores `r`/`s` inválidos;
+- rechazo antes de crear staging cuando falla el proof y rechazo de una
+  blocklist estructuralmente válida pero no autorizada;
+- promoción autenticada y rollback, recuperación candidate-only solo con
+  `/blocklist.new.auth`, rechazo permanente de un candidato unsigned y
+  compatibilidad de boot con active/old legacy unsigned;
+- modelo de cada frontera de corte: escritura del candidato, persistencia del
+  proof, `active -> old`, `new -> active`, revalidación, retirada del proof y
+  retirada final del rollback;
+- UI de dos ficheros, tamaño exacto de firma y header hexadecimal; guards
+  Host/sesión/CSRF y POST anteriores permanecen obligatorios;
+- signer genérico: validación del blob, manifest de 64 bytes, digest de
+  protocolo, P-256, `r || s` fijo con low-S y sustitución atómica;
+- ausencia de clave privada, fetch remoto y OTA, además de todas las regresiones
+  P5.1–P5.4 y los archivos protegidos.
+
+Las fixtures son locales y offline. Incluyen un vector público SigVer
+P-256/SHA-256 de NIST y un vector de protocolo creado con una clave desechable
+TEST-ONLY fuera del repositorio. Solo quedan payload, proof y clave pública; la
+clave privada temporal fue destruida y la clave pública de test no aparece en la
+tabla de confianza del firmware. La procedencia y el SHA-256 del paquete NIST se
+registran junto a las fixtures. Ningún test firma con la clave de producción.
+
+La cobertura host modela la secuencia de filesystem, pero no demuestra la
+durabilidad ni atomicidad real de LittleFS. Quedan pendientes HIL del multipart
+real y cortes controlados en cada frontera. V1 acepta deliberadamente replay de
+una release correctamente firmada y conserva compatibilidad de boot con listas
+legacy unsigned; tampoco guarda un proof activo permanente, por lo que aporta
+procedencia de ingreso, no attestation continua en reposo.
+
+La validación local integrada termina con **231 passed**, Ruff y ambos diff
+checks correctos, `ci_checks repository` verde y archivos protegidos intactos.
+PlatformIO termina `SUCCESS`: 50.828/327.680 B de RAM (15,5 %),
+1.127.265/1.376.256 B de flash enlazada (81,9 %) y 248.991 B de margen enlazado.
+`firmware.bin` mide 1.165.808 B, deja 210.448 B físicos (205,52 KiB) y tiene
+SHA-256 `67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
+Frente a P5.4 son +144 B RAM, +4.088 B enlazados y +4.448 B físicos. La CI real
+y todo HIL P5.5 siguen pendientes.
+
 ## Integración continua — implementado en P3
 
 `.github/workflows/ci.yml` valida los pushes y pull requests dirigidos a `main`

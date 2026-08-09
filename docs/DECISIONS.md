@@ -462,3 +462,60 @@
   margen físico 214.896 bytes y SHA-256
   `81BD51E0582A34F206CC08FB4A2F8643DC3999062B4C611B67AE0831C7226A97`.
   Esto no sustituye CI real ni HIL.
+
+## ADR-008 — P5.5 procedencia firmada para upload manual de blocklist
+
+- Fecha: 2026-08-09.
+- Estado: accepted; implementación y validación host/build locales completadas,
+  CI y HIL pendientes.
+- Decisión criptográfica: cada nuevo upload manual exige ECDSA P-256 con
+  SHA-256. La tabla read-only del firmware contiene exactamente la clave pública
+  SEC1 aprobada, Key ID `2173599637`, y solo acepta List ID `1`. La clave privada
+  de producción no se solicita ni entra en firmware, repositorio, tests o CI.
+- Protocolo: `blocklist.bin` conserva sin cambios sus registros little-endian de
+  cinco bytes. `blocklist.sig` tiene exactamente 128 bytes: manifest fijo de 64
+  bytes y firma raw `r || s` de 64 bytes. Se firma el SHA-256 de los 16 bytes
+  ASCII `NSM-BLOCKLIST-V1` concatenados con el manifest. La UI convierte el proof
+  a 256 caracteres hex en `X-Blocklist-Proof`; el binario sigue siendo la única
+  parte multipart.
+- Gate antes de escribir: Host, sesión y CSRF se validan primero. Después se
+  decodifica estrictamente el header, se comprueban magic/versiones/algoritmo,
+  flags, IDs, secuencia, longitud y recuento, y se verifica ECDSA. Un fallo termina
+  antes de abrir `/blocklist.new`. Tras recibirlo se valida el blob y se compara
+  el SHA-256 de los bytes persistidos con el manifest.
+- Staging: durante la transacción solo existen `/blocklist.new` y
+  `/blocklist.new.auth`. Todo descarte elimina primero el proof y después el
+  candidato. En promoción el proof sobrevive a `active -> old` y `new -> active`;
+  se autentica de nuevo el active, se elimina el proof mientras old todavía está
+  disponible y old se elimina al final.
+- Recovery: active y old legacy estructuralmente válidos siguen siendo
+  compatibles sin escrituras de migración. Un candidate-only solo puede ganar si
+  está acompañado por un proof válido. El estado active+proof sin candidate marca
+  una promoción interrumpida y se autentica antes de retirar old. Un candidato
+  unsigned nunca se recupera. Los restos ordinarios se limpian siempre proof
+  primero, luego data.
+- Semántica V1: la firma prueba el origen al ingresar. No se conserva un sidecar
+  del active, no existe attestation permanente al boot, no se añade estado NVS y
+  no se impone anti-replay; una release antigua correctamente firmada puede volver
+  a instalarse deliberadamente. Estas limitaciones son explícitas y bloquean
+  presentar P5.5 como cierre completo de integridad en reposo.
+- Herramienta: `tools/sign_blocklist.py` recibe rutas y metadatos por CLI, valida
+  la blocklist con los invariantes del builder, deriva el Key ID del punto público,
+  exige P-256, convierte la firma DER de OpenSSL a `r || s` fijo/low-S y publica
+  el proof mediante temporal+fsync+replace. Nunca incorpora ni imprime una clave.
+- Fixtures: un vector público NIST y un vector NetShield TEST-ONLY permiten
+  verificar independientemente la implementación. La clave de test se generó
+  fuera del repositorio y se destruyó; únicamente material público queda
+  versionable y una gate impide que esa clave entre en la tabla de producción.
+- Consecuencias: P5.5 reduce TM-06 y TM-13 frente a una blocklist elegida por un
+  administrador/sesión comprometidos, sin reactivar fetch ni firmware OTA. No
+  protege el canal HTTP administrativo, no evita replay, no autentica listas
+  legacy ya instaladas y todavía exige CI y HIL de filesystem/cortes. PILOT sigue
+  **NO-GO**.
+- Verificación local: 231 tests aprobados; Ruff, `ci_checks repository`, ambos
+  diff checks y el gate de archivos protegidos pasan. PlatformIO termina
+  `SUCCESS` con 50.828 B de RAM, 1.127.265 B enlazados y 248.991 B de margen
+  enlazado. `firmware.bin` mide 1.165.808 B, deja 210.448 B físicos y su SHA-256
+  es `67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
+  Frente a P5.4 aumenta 144 B RAM, 4.088 B enlazados y 4.448 B físicos. Esto no
+  sustituye CI real ni HIL multipart/power-cut.

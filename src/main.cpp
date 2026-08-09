@@ -15,9 +15,14 @@
 extern "C" {
 #include <mbedtls/constant_time.h>
 }
+#include <mbedtls/bignum.h>
+#include <mbedtls/ecdsa.h>
+#include <mbedtls/ecp.h>
 #include <mbedtls/md.h>
 #include <mbedtls/pkcs5.h>
 #include <mbedtls/platform_util.h>
+#include <mbedtls/sha256.h>
+#include "blocklist_trust.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_VERBOSE
@@ -35,8 +40,10 @@ static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const char* BLOCKLIST_NEW_PATH = "/blocklist.new";
+static const char* BLOCKLIST_NEW_AUTH_PATH = "/blocklist.new.auth";
 static const char* BLOCKLIST_OLD_PATH = "/blocklist.old";
 static const char* BLOCKLIST_UPLOAD_ROUTE = "/upload";
+static const char* BLOCKLIST_PROOF_HEADER = "X-Blocklist-Proof";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 static const uint32_t BLOCKLIST_MAX_RECORDS = 104857;
@@ -760,6 +767,20 @@ enum class BlocklistValidationStatus : uint8_t {
   UNSORTED,
 };
 
+enum class BlocklistProofStatus : uint8_t {
+  VALID,
+  MISSING,
+  BAD_SIZE,
+  BAD_ENCODING,
+  BAD_MANIFEST,
+  UNKNOWN_KEY,
+  INVALID_SIGNATURE,
+  PAYLOAD_INVALID,
+  PAYLOAD_MISMATCH,
+  STORAGE_ERROR,
+  CRYPTO_ERROR,
+};
+
 static const char* blocklistValidationToken(BlocklistValidationStatus status) {
   switch (status) {
     case BlocklistValidationStatus::VALID: return "valid";
@@ -771,6 +792,23 @@ static const char* blocklistValidationToken(BlocklistValidationStatus status) {
     case BlocklistValidationStatus::READ_FAILED: return "read_failed";
     case BlocklistValidationStatus::DUPLICATE: return "duplicate";
     case BlocklistValidationStatus::UNSORTED: return "unsorted";
+  }
+  return "unknown";
+}
+
+static const char* blocklistProofToken(BlocklistProofStatus status) {
+  switch (status) {
+    case BlocklistProofStatus::VALID: return "valid";
+    case BlocklistProofStatus::MISSING: return "missing";
+    case BlocklistProofStatus::BAD_SIZE: return "bad_size";
+    case BlocklistProofStatus::BAD_ENCODING: return "bad_encoding";
+    case BlocklistProofStatus::BAD_MANIFEST: return "bad_manifest";
+    case BlocklistProofStatus::UNKNOWN_KEY: return "unknown_key";
+    case BlocklistProofStatus::INVALID_SIGNATURE: return "invalid_signature";
+    case BlocklistProofStatus::PAYLOAD_INVALID: return "payload_invalid";
+    case BlocklistProofStatus::PAYLOAD_MISMATCH: return "payload_mismatch";
+    case BlocklistProofStatus::STORAGE_ERROR: return "storage_error";
+    case BlocklistProofStatus::CRYPTO_ERROR: return "crypto_error";
   }
   return "unknown";
 }
@@ -848,9 +886,248 @@ static BlocklistValidationStatus validateBlocklistFile(
   return BlocklistValidationStatus::VALID;
 }
 
+static uint32_t readLittleEndian32(const uint8_t* input) {
+  return static_cast<uint32_t>(input[0]) |
+         static_cast<uint32_t>(input[1]) << 8 |
+         static_cast<uint32_t>(input[2]) << 16 |
+         static_cast<uint32_t>(input[3]) << 24;
+}
+
+static uint64_t readLittleEndian64(const uint8_t* input) {
+  uint64_t value = 0;
+  for (size_t index = 0; index < 8; index++) {
+    value |= static_cast<uint64_t>(input[index]) << (8 * index);
+  }
+  return value;
+}
+
+static BlocklistProofStatus decodeBlocklistProofHex(
+    const String& encoded, uint8_t proof[kBlocklistProofSize]) {
+  secureZero(proof, kBlocklistProofSize);
+  if (!encoded.length()) return BlocklistProofStatus::MISSING;
+  if (encoded.length() != kBlocklistProofHexSize) return BlocklistProofStatus::BAD_SIZE;
+  for (size_t index = 0; index < kBlocklistProofSize; index++) {
+    const int high = hexValue(encoded[index * 2]);
+    const int low = hexValue(encoded[index * 2 + 1]);
+    if (high < 0 || low < 0) {
+      secureZero(proof, kBlocklistProofSize);
+      return BlocklistProofStatus::BAD_ENCODING;
+    }
+    proof[index] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return BlocklistProofStatus::VALID;
+}
+
+static BlocklistProofStatus validateBlocklistProofEnvelope(
+    const uint8_t proof[kBlocklistProofSize]) {
+  if (memcmp(proof + kBlocklistMagicOffset, kBlocklistManifestMagic,
+             sizeof(kBlocklistManifestMagic)) != 0 ||
+      proof[kBlocklistManifestVersionOffset] != kBlocklistManifestVersion ||
+      proof[kBlocklistFormatVersionOffset] != kBlocklistFormatVersion ||
+      proof[kBlocklistAlgorithmOffset] != kBlocklistSignatureAlgorithm ||
+      proof[kBlocklistFlagsOffset] != kBlocklistManifestFlags) {
+    return BlocklistProofStatus::BAD_MANIFEST;
+  }
+
+  const uint32_t keyId = readLittleEndian32(proof + kBlocklistKeyIdOffset);
+  const TrustedBlocklistKey* trustedKey = findTrustedBlocklistKey(keyId);
+  if (!trustedKey) return BlocklistProofStatus::UNKNOWN_KEY;
+  if (readLittleEndian32(proof + kBlocklistListIdOffset) !=
+          kBlocklistAcceptedListId ||
+      readLittleEndian64(proof + kBlocklistSequenceOffset) == 0) {
+    return BlocklistProofStatus::BAD_MANIFEST;
+  }
+
+  const uint32_t payloadSize =
+    readLittleEndian32(proof + kBlocklistPayloadSizeOffset);
+  const uint32_t recordCount =
+    readLittleEndian32(proof + kBlocklistRecordCountOffset);
+  if (payloadSize == 0 || payloadSize > BLOCKLIST_MAX_BYTES ||
+      payloadSize % HASH_BYTES != 0 || recordCount == 0 ||
+      recordCount > BLOCKLIST_MAX_RECORDS ||
+      recordCount != payloadSize / HASH_BYTES) {
+    return BlocklistProofStatus::BAD_MANIFEST;
+  }
+
+  uint8_t signedDigest[32];
+  secureZero(signedDigest, sizeof(signedDigest));
+  mbedtls_sha256_context shaContext;
+  mbedtls_sha256_init(&shaContext);
+  int result = mbedtls_sha256_starts(&shaContext, 0);
+  if (result == 0) {
+    result = mbedtls_sha256_update(
+      &shaContext, kBlocklistSignatureDomain,
+      sizeof(kBlocklistSignatureDomain));
+  }
+  if (result == 0) {
+    result = mbedtls_sha256_update(&shaContext, proof, kBlocklistManifestSize);
+  }
+  if (result == 0) result = mbedtls_sha256_finish(&shaContext, signedDigest);
+  mbedtls_sha256_free(&shaContext);
+  if (result != 0) {
+    secureZero(signedDigest, sizeof(signedDigest));
+    return BlocklistProofStatus::CRYPTO_ERROR;
+  }
+
+  mbedtls_ecp_group group;
+  mbedtls_ecp_point publicPoint;
+  mbedtls_mpi signatureR;
+  mbedtls_mpi signatureS;
+  mbedtls_ecp_group_init(&group);
+  mbedtls_ecp_point_init(&publicPoint);
+  mbedtls_mpi_init(&signatureR);
+  mbedtls_mpi_init(&signatureS);
+
+  int setupResult = mbedtls_ecp_group_load(&group, MBEDTLS_ECP_DP_SECP256R1);
+  if (setupResult == 0) {
+    setupResult = mbedtls_ecp_point_read_binary(
+      &group, &publicPoint, trustedKey->sec1PublicKey, kBlocklistSec1PublicKeySize);
+  }
+  if (setupResult == 0) {
+    setupResult = mbedtls_ecp_check_pubkey(&group, &publicPoint);
+  }
+  if (setupResult == 0) {
+    setupResult = mbedtls_mpi_read_binary(
+      &signatureR, proof + kBlocklistSignatureROffset,
+      kBlocklistSignatureSize / 2);
+  }
+  if (setupResult == 0) {
+    setupResult = mbedtls_mpi_read_binary(
+      &signatureS, proof + kBlocklistSignatureSOffset,
+      kBlocklistSignatureSize / 2);
+  }
+  if (setupResult == 0) {
+    result = mbedtls_ecdsa_verify(
+      &group, signedDigest, sizeof(signedDigest), &publicPoint,
+      &signatureR, &signatureS);
+  }
+
+  mbedtls_mpi_free(&signatureS);
+  mbedtls_mpi_free(&signatureR);
+  mbedtls_ecp_point_free(&publicPoint);
+  mbedtls_ecp_group_free(&group);
+  secureZero(signedDigest, sizeof(signedDigest));
+  if (setupResult != 0) return BlocklistProofStatus::CRYPTO_ERROR;
+  if (result == 0) return BlocklistProofStatus::VALID;
+  if (result == MBEDTLS_ERR_ECP_VERIFY_FAILED ||
+      result == MBEDTLS_ERR_ECP_BAD_INPUT_DATA ||
+      result == MBEDTLS_ERR_MPI_BAD_INPUT_DATA) {
+    return BlocklistProofStatus::INVALID_SIGNATURE;
+  }
+  return BlocklistProofStatus::CRYPTO_ERROR;
+}
+
+static BlocklistProofStatus calculateBlocklistSha256(
+    const char* path, uint8_t digest[32]) {
+  secureZero(digest, 32);
+  if (!LittleFS.exists(path)) return BlocklistProofStatus::MISSING;
+  File file = LittleFS.open(path, "r");
+  if (!file) return BlocklistProofStatus::STORAGE_ERROR;
+
+  mbedtls_sha256_context shaContext;
+  mbedtls_sha256_init(&shaContext);
+  int result = mbedtls_sha256_starts(&shaContext, 0);
+  uint8_t readBuffer[320];
+  size_t remaining = file.size();
+  while (result == 0 && remaining > 0) {
+    const size_t wanted = min(remaining, sizeof(readBuffer));
+    if (file.read(readBuffer, wanted) != wanted) {
+      file.close();
+      mbedtls_sha256_free(&shaContext);
+      secureZero(readBuffer, sizeof(readBuffer));
+      return BlocklistProofStatus::STORAGE_ERROR;
+    }
+    result = mbedtls_sha256_update(&shaContext, readBuffer, wanted);
+    remaining -= wanted;
+  }
+  if (result == 0) result = mbedtls_sha256_finish(&shaContext, digest);
+  mbedtls_sha256_free(&shaContext);
+  file.close();
+  secureZero(readBuffer, sizeof(readBuffer));
+  if (result != 0) {
+    secureZero(digest, 32);
+    return BlocklistProofStatus::CRYPTO_ERROR;
+  }
+  return BlocklistProofStatus::VALID;
+}
+
+static BlocklistProofStatus authenticateBlocklistFile(
+    const char* path, const uint8_t proof[kBlocklistProofSize],
+    uint32_t* validatedRecords = nullptr) {
+  if (validatedRecords) *validatedRecords = 0;
+  const BlocklistProofStatus envelopeStatus = validateBlocklistProofEnvelope(proof);
+  if (envelopeStatus != BlocklistProofStatus::VALID) return envelopeStatus;
+
+  uint32_t records = 0;
+  if (validateBlocklistFile(path, true, &records) !=
+      BlocklistValidationStatus::VALID) {
+    return BlocklistProofStatus::PAYLOAD_INVALID;
+  }
+  File file = LittleFS.open(path, "r");
+  if (!file) return BlocklistProofStatus::STORAGE_ERROR;
+  const size_t payloadSize = file.size();
+  file.close();
+  if (payloadSize != readLittleEndian32(proof + kBlocklistPayloadSizeOffset) ||
+      records != readLittleEndian32(proof + kBlocklistRecordCountOffset)) {
+    return BlocklistProofStatus::PAYLOAD_MISMATCH;
+  }
+
+  uint8_t digest[32];
+  const BlocklistProofStatus digestStatus = calculateBlocklistSha256(path, digest);
+  if (digestStatus != BlocklistProofStatus::VALID) {
+    secureZero(digest, sizeof(digest));
+    return digestStatus;
+  }
+  const bool digestMatches =
+    mbedtls_ct_memcmp(digest, proof + kBlocklistPayloadSha256Offset,
+                      sizeof(digest)) == 0;
+  secureZero(digest, sizeof(digest));
+  if (!digestMatches) return BlocklistProofStatus::PAYLOAD_MISMATCH;
+  if (validatedRecords) *validatedRecords = records;
+  return BlocklistProofStatus::VALID;
+}
+
+static BlocklistProofStatus readBlocklistProofFile(
+    uint8_t proof[kBlocklistProofSize]) {
+  secureZero(proof, kBlocklistProofSize);
+  if (!LittleFS.exists(BLOCKLIST_NEW_AUTH_PATH)) return BlocklistProofStatus::MISSING;
+  File proofFile = LittleFS.open(BLOCKLIST_NEW_AUTH_PATH, "r");
+  if (!proofFile) return BlocklistProofStatus::STORAGE_ERROR;
+  if (proofFile.size() != kBlocklistProofSize ||
+      proofFile.read(proof, kBlocklistProofSize) != kBlocklistProofSize ||
+      proofFile.available() != 0) {
+    proofFile.close();
+    secureZero(proof, kBlocklistProofSize);
+    return BlocklistProofStatus::BAD_SIZE;
+  }
+  proofFile.close();
+  return BlocklistProofStatus::VALID;
+}
+
+static BlocklistProofStatus authenticateBlocklistWithStoredProof(
+    const char* path, uint32_t* validatedRecords = nullptr) {
+  uint8_t proof[kBlocklistProofSize];
+  const BlocklistProofStatus readStatus = readBlocklistProofFile(proof);
+  if (readStatus != BlocklistProofStatus::VALID) {
+    secureZero(proof, sizeof(proof));
+    return readStatus;
+  }
+  const BlocklistProofStatus status =
+    authenticateBlocklistFile(path, proof, validatedRecords);
+  secureZero(proof, sizeof(proof));
+  return status;
+}
+
 static bool removeBlocklistFile(const char* path) {
   if (LittleFS.remove(path)) return !LittleFS.exists(path);
   return !LittleFS.exists(path);
+}
+
+static bool removeBlocklistCandidateFiles() {
+  // Proof-first cleanup reserves auth-without-candidate as the interrupted
+  // new-to-active promotion marker used by boot recovery.
+  if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) return false;
+  return removeBlocklistFile(BLOCKLIST_NEW_PATH);
 }
 
 static bool reopenBlocklist() {
@@ -870,6 +1147,8 @@ static bool reopenBlocklist() {
   return true;
 }
 
+static bool restoreOldBlocklist();
+
 static bool recoverBlocklistFiles() {
   const BlocklistValidationStatus activeStatus =
     validateBlocklistFile(BLOCKLIST_PATH, false);
@@ -883,12 +1162,34 @@ static bool recoverBlocklistFiles() {
                 blocklistValidationToken(newStatus));
 
   if (activeStatus == BlocklistValidationStatus::VALID) {
-    return removeBlocklistFile(BLOCKLIST_NEW_PATH) &&
-           removeBlocklistFile(BLOCKLIST_OLD_PATH);
+    const bool candidateExists = LittleFS.exists(BLOCKLIST_NEW_PATH);
+    const bool proofExists = LittleFS.exists(BLOCKLIST_NEW_AUTH_PATH);
+    if (!candidateExists && proofExists) {
+      // The proof deliberately remains while new is renamed to active. This is
+      // the only state in which auth may exist without a candidate.
+      const BlocklistProofStatus promotedStatus =
+        authenticateBlocklistWithStoredProof(BLOCKLIST_PATH);
+      Serial.printf("[blocklist] recovery promoted proof=%s\n",
+                    blocklistProofToken(promotedStatus));
+      if (promotedStatus == BlocklistProofStatus::VALID) {
+        return removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH) &&
+               removeBlocklistFile(BLOCKLIST_OLD_PATH);
+      }
+      if (oldStatus != BlocklistValidationStatus::VALID) return false;
+      if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
+      if (!removeBlocklistCandidateFiles()) return false;
+      if (!LittleFS.rename(BLOCKLIST_OLD_PATH, BLOCKLIST_PATH)) return false;
+      return validateBlocklistFile(BLOCKLIST_PATH, false) ==
+             BlocklistValidationStatus::VALID;
+    }
+    if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) return false;
+    if (!removeBlocklistFile(BLOCKLIST_NEW_PATH)) return false;
+    return removeBlocklistFile(BLOCKLIST_OLD_PATH);
   }
 
   if (oldStatus == BlocklistValidationStatus::VALID) {
     if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
+    if (!removeBlocklistCandidateFiles()) return false;
     if (!LittleFS.rename(BLOCKLIST_OLD_PATH, BLOCKLIST_PATH)) return false;
     if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
         BlocklistValidationStatus::VALID) {
@@ -898,20 +1199,21 @@ static bool recoverBlocklistFiles() {
       }
       return false;
     }
-    return removeBlocklistFile(BLOCKLIST_NEW_PATH);
+    return true;
   }
 
+  BlocklistProofStatus candidateProofStatus = BlocklistProofStatus::MISSING;
   if (newStatus == BlocklistValidationStatus::VALID) {
+    candidateProofStatus = authenticateBlocklistWithStoredProof(BLOCKLIST_NEW_PATH);
+  }
+  Serial.printf("[blocklist] recovery candidate proof=%s\n",
+                blocklistProofToken(candidateProofStatus));
+  if (candidateProofStatus == BlocklistProofStatus::VALID) {
     if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
     if (!LittleFS.rename(BLOCKLIST_NEW_PATH, BLOCKLIST_PATH)) return false;
-    if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
-        BlocklistValidationStatus::VALID) {
-      if (LittleFS.exists(BLOCKLIST_PATH) &&
-          !LittleFS.rename(BLOCKLIST_PATH, BLOCKLIST_NEW_PATH)) {
-        Serial.println("[blocklist] candidate recovery rename failed");
-      }
-      return false;
-    }
+    if (authenticateBlocklistWithStoredProof(BLOCKLIST_PATH) !=
+        BlocklistProofStatus::VALID) return false;
+    if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) return false;
     return removeBlocklistFile(BLOCKLIST_OLD_PATH);
   }
 
@@ -937,16 +1239,22 @@ static bool recoverBlocklistFiles() {
 static bool restoreOldBlocklist() {
   if (blocklist) blocklist.close();
   numHashes = 0;
-  if (!LittleFS.exists(BLOCKLIST_OLD_PATH)) return false;
+  blocklistHealthy = false;
+  if (validateBlocklistFile(BLOCKLIST_OLD_PATH, false) !=
+      BlocklistValidationStatus::VALID) return false;
   if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
+  // Keep old at its rollback path until proof and candidate are both gone. A
+  // reset at any intermediate point therefore re-enters the old-first branch.
+  if (!removeBlocklistCandidateFiles()) return false;
   if (!LittleFS.rename(BLOCKLIST_OLD_PATH, BLOCKLIST_PATH)) return false;
   return reopenBlocklist();
 }
 
 static bool promoteBlocklistCandidate() {
   uint32_t candidateRecords = 0;
-  if (validateBlocklistFile(BLOCKLIST_NEW_PATH, true, &candidateRecords) !=
-      BlocklistValidationStatus::VALID) return false;
+  if (authenticateBlocklistWithStoredProof(BLOCKLIST_NEW_PATH,
+                                            &candidateRecords) !=
+      BlocklistProofStatus::VALID) return false;
   if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
       BlocklistValidationStatus::VALID) {
     enterStorageFailClosed("active blocklist validation failed");
@@ -963,12 +1271,23 @@ static bool promoteBlocklistCandidate() {
   }
   if (!LittleFS.rename(BLOCKLIST_NEW_PATH, BLOCKLIST_PATH)) {
     const bool restored = restoreOldBlocklist();
-    removeBlocklistFile(BLOCKLIST_NEW_PATH);
     if (!restored) enterStorageFailClosed("blocklist rollback failed");
     return false;
   }
-  if (!reopenBlocklist() || numHashes != candidateRecords) {
-    if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist rollback failed");
+  uint32_t promotedRecords = 0;
+  if (authenticateBlocklistWithStoredProof(BLOCKLIST_PATH, &promotedRecords) !=
+        BlocklistProofStatus::VALID ||
+      promotedRecords != candidateRecords || !reopenBlocklist() ||
+      numHashes != candidateRecords) {
+    if (!restoreOldBlocklist()) {
+      enterStorageFailClosed("blocklist rollback failed");
+    }
+    return false;
+  }
+  if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) {
+    if (!restoreOldBlocklist()) {
+      enterStorageFailClosed("blocklist rollback failed");
+    }
     return false;
   }
   if (!LittleFS.remove(BLOCKLIST_OLD_PATH)) {
@@ -988,6 +1307,9 @@ enum class BlocklistUploadStatus : uint8_t {
   STORAGE_ERROR,
   WRITE_ERROR,
   INVALID,
+  PROOF_REQUIRED,
+  AUTH_INVALID,
+  CRYPTO_ERROR,
   ABORTED,
   UNSUPPORTED_MEDIA,
   PROMOTION_ERROR,
@@ -999,16 +1321,36 @@ static bool uploadOwnsTransaction = false;
 static size_t uploadBytesWritten = 0;
 static BlocklistUploadStatus blocklistUploadStatus = BlocklistUploadStatus::IDLE;
 static File upFile;
+static uint8_t uploadProof[kBlocklistProofSize];
 
 static bool discardBlocklistCandidate() {
   if (upFile) upFile.close();
-  return removeBlocklistFile(BLOCKLIST_NEW_PATH);
+  return removeBlocklistCandidateFiles();
+}
+
+static bool writeBlocklistCandidateProof() {
+  if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) return false;
+  File proofFile = LittleFS.open(BLOCKLIST_NEW_AUTH_PATH, "w");
+  if (!proofFile) return false;
+  const size_t written = proofFile.write(uploadProof, kBlocklistProofSize);
+  proofFile.flush();
+  proofFile.close();
+  if (written != kBlocklistProofSize) return false;
+
+  uint8_t storedProof[kBlocklistProofSize];
+  const BlocklistProofStatus readStatus = readBlocklistProofFile(storedProof);
+  const bool matches = readStatus == BlocklistProofStatus::VALID &&
+                       mbedtls_ct_memcmp(storedProof, uploadProof,
+                                         sizeof(storedProof)) == 0;
+  secureZero(storedProof, sizeof(storedProof));
+  return matches;
 }
 
 static void resetBlocklistUploadRequestState() {
   uploadAuthorized = false;
   uploadBytesWritten = 0;
   blocklistUploadStatus = BlocklistUploadStatus::IDLE;
+  secureZero(uploadProof, sizeof(uploadProof));
 }
 
 static void failBlocklistUpload(BlocklistUploadStatus status) {
@@ -1061,6 +1403,12 @@ static void handleUploadDone() {
       status = 413; message = "blocklist too large"; break;
     case BlocklistUploadStatus::INVALID:
       status = 400; message = "invalid blocklist"; break;
+    case BlocklistUploadStatus::PROOF_REQUIRED:
+      status = 400; message = "signed blocklist proof required"; break;
+    case BlocklistUploadStatus::AUTH_INVALID:
+      status = 400; message = "invalid signed blocklist"; break;
+    case BlocklistUploadStatus::CRYPTO_ERROR:
+      status = 500; message = "blocklist verification unavailable"; break;
     case BlocklistUploadStatus::ABORTED:
       status = 400; message = "blocklist upload aborted"; break;
     case BlocklistUploadStatus::UNSUPPORTED_MEDIA:
@@ -1104,6 +1452,25 @@ static void handleUpload(HTTPUpload& u) {
         }
         break;
       }
+      String encodedProof = web.header(BLOCKLIST_PROOF_HEADER);
+      BlocklistProofStatus proofStatus =
+        decodeBlocklistProofHex(encodedProof, uploadProof);
+      clearSensitiveString(encodedProof);
+      if (proofStatus == BlocklistProofStatus::VALID) {
+        proofStatus = validateBlocklistProofEnvelope(uploadProof);
+      }
+      if (proofStatus != BlocklistProofStatus::VALID) {
+        Serial.printf("[blocklist] upload proof rejected=%s\n",
+                      blocklistProofToken(proofStatus));
+        if (proofStatus == BlocklistProofStatus::MISSING) {
+          blocklistUploadStatus = BlocklistUploadStatus::PROOF_REQUIRED;
+        } else if (proofStatus == BlocklistProofStatus::CRYPTO_ERROR) {
+          blocklistUploadStatus = BlocklistUploadStatus::CRYPTO_ERROR;
+        } else {
+          blocklistUploadStatus = BlocklistUploadStatus::AUTH_INVALID;
+        }
+        break;
+      }
       uploadBytesWritten = 0;
       uploadOwnsTransaction = false;
       blocklistTransactionActive = true;
@@ -1114,7 +1481,7 @@ static void handleUpload(HTTPUpload& u) {
         failBlocklistUpload(BlocklistUploadStatus::TOO_LARGE);
         break;
       }
-      if (!removeBlocklistFile(BLOCKLIST_NEW_PATH)) {
+      if (!removeBlocklistCandidateFiles()) {
         failBlocklistUpload(BlocklistUploadStatus::STORAGE_ERROR);
         break;
       }
@@ -1160,6 +1527,24 @@ static void handleUpload(HTTPUpload& u) {
         failBlocklistUpload(BlocklistUploadStatus::INVALID);
         break;
       }
+      if (!writeBlocklistCandidateProof()) {
+        failBlocklistUpload(BlocklistUploadStatus::STORAGE_ERROR);
+        break;
+      }
+      const BlocklistProofStatus proofStatus =
+        authenticateBlocklistWithStoredProof(BLOCKLIST_NEW_PATH);
+      if (proofStatus != BlocklistProofStatus::VALID) {
+        Serial.printf("[blocklist] candidate proof rejected=%s\n",
+                      blocklistProofToken(proofStatus));
+        const BlocklistUploadStatus failureStatus =
+          proofStatus == BlocklistProofStatus::CRYPTO_ERROR
+            ? BlocklistUploadStatus::CRYPTO_ERROR
+            : (proofStatus == BlocklistProofStatus::STORAGE_ERROR
+                 ? BlocklistUploadStatus::STORAGE_ERROR
+                 : BlocklistUploadStatus::AUTH_INVALID);
+        failBlocklistUpload(failureStatus);
+        break;
+      }
       blocklistUploadStatus = BlocklistUploadStatus::CANDIDATE_READY;
       break;
     }
@@ -1167,8 +1552,12 @@ static void handleUpload(HTTPUpload& u) {
       if (!uploadAuthorized) break;
       if (!uploadOwnsTransaction) break;
       if (upFile) upFile.close();
-      if (!LittleFS.remove(BLOCKLIST_NEW_PATH) &&
-          LittleFS.exists(BLOCKLIST_NEW_PATH)) {
+      bool cleaned = removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH);
+      if (cleaned) {
+        cleaned = LittleFS.remove(BLOCKLIST_NEW_PATH) ||
+                  !LittleFS.exists(BLOCKLIST_NEW_PATH);
+      }
+      if (!cleaned) {
         blocklistUploadStatus = BlocklistUploadStatus::STORAGE_ERROR;
       } else {
         blocklistUploadStatus = BlocklistUploadStatus::ABORTED;
@@ -1530,7 +1919,9 @@ void setup() {
   // observes BOOT released, then measures a new continuous hold at runtime.
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
-  static const char* REQUEST_HEADERS[] = {"Host", "Cookie", "X-CSRF-Token"};
+  static const char* REQUEST_HEADERS[] = {
+    "Host", "Cookie", "X-CSRF-Token", BLOCKLIST_PROOF_HEADER
+  };
   web.collectHeaders(REQUEST_HEADERS, sizeof(REQUEST_HEADERS) / sizeof(REQUEST_HEADERS[0]));
 
   if (!LittleFS.begin(false)) enterStorageFailClosed("LittleFS mount failed");

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -23,6 +25,24 @@ EXPECTED_ACTIONS = {
 }
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = Path(".github/workflows/ci.yml")
+P5_5_FIXTURE_DIR = Path("tests/fixtures/p5_5_crypto")
+P5_5_PROTOCOL_FIXTURE = P5_5_FIXTURE_DIR / "netshield_protocol_test_vector.json"
+P5_5_TRUST_HEADER = Path("src/blocklist_trust.h")
+P5_5_PRODUCTION_KEY_ID = 2_173_599_637
+P5_5_PRODUCTION_PUBLIC_KEY_HEX = (
+    "04C642B500A5378CD0A4FDD3FC1028FBF3E3E908BD7F7A855485C97473050571762"
+    "EAED935008E0A4F32EB0FA66B51D43E3F8F849FFA3299355A32C39433BEC765"
+)
+PRIVATE_KEY_SUFFIXES = {".key", ".p8", ".p12", ".pfx"}
+PRIVATE_FIXTURE_FIELDS = {
+    "d",
+    "k",
+    "private_key",
+    "private_key_pem",
+    "private_scalar",
+    "secret_exponent",
+    "secret_scalar",
+}
 
 ASSIGNMENT_PATTERN = re.compile(
     r"""(?ix)
@@ -56,6 +76,11 @@ def _git(root: Path, *arguments: str) -> bytes:
 
 def _tracked_files(root: Path) -> list[str]:
     output = _git(root, "ls-files", "-z")
+    return [item.decode("utf-8") for item in output.split(b"\0") if item]
+
+
+def _untracked_files(root: Path) -> list[str]:
+    output = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
     return [item.decode("utf-8") for item in output.split(b"\0") if item]
 
 
@@ -105,7 +130,7 @@ def _secret_patterns() -> tuple[tuple[str, re.Pattern[str]], ...]:
             "private key",
             re.compile(
                 "-----BEGIN "
-                + r"(?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"
+                + r"(?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
             ),
         ),
         (
@@ -162,6 +187,93 @@ def _scan_tracked_secrets(root: Path, tracked_files: Sequence[str]) -> list[str]
     return findings
 
 
+def _find_private_fixture_fields(value: object, path: str = "$") -> list[str]:
+    findings: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key.casefold() in PRIVATE_FIXTURE_FIELDS:
+                findings.append(child_path)
+            findings.extend(_find_private_fixture_fields(child, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            findings.extend(_find_private_fixture_fields(child, f"{path}[{index}]"))
+    return findings
+
+
+def _check_p5_5_key_material(root: Path, repository_files: Sequence[str]) -> None:
+    """Reject private fixtures and keep the disposable test key out of firmware."""
+    normalized_fixture_dir = P5_5_FIXTURE_DIR.as_posix() + "/"
+    for relative_path in repository_files:
+        suffix = Path(relative_path).suffix.casefold()
+        if suffix in PRIVATE_KEY_SUFFIXES:
+            raise CheckError(f"private-key file type is forbidden: {relative_path}")
+
+        path = root / relative_path
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise CheckError(f"cannot inspect repository file {relative_path}: {error}") from error
+        if b"\0" not in data and re.search(
+            rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
+            data,
+        ):
+            raise CheckError(f"private-key PEM material is forbidden: {relative_path}")
+
+        normalized_path = relative_path.replace("\\", "/")
+        if not normalized_path.startswith(normalized_fixture_dir) or suffix != ".json":
+            continue
+        try:
+            document = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CheckError(f"invalid P5.5 JSON fixture {relative_path}: {error}") from error
+        private_fields = _find_private_fixture_fields(document)
+        if private_fields:
+            raise CheckError(
+                f"private signing fields are forbidden in {relative_path}: "
+                + ", ".join(private_fields)
+            )
+
+    fixture_path = root / P5_5_PROTOCOL_FIXTURE
+    trust_path = root / P5_5_TRUST_HEADER
+    if not fixture_path.is_file():
+        raise CheckError(f"required public test fixture is missing: {P5_5_PROTOCOL_FIXTURE}")
+    if not trust_path.is_file():
+        raise CheckError(f"production trust header is missing: {P5_5_TRUST_HEADER}")
+
+    try:
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        test_key_id = int(fixture["test_key_id"])
+        test_public_hex = str(fixture["public_key_sec1_hex"]).upper()
+        test_fingerprint = str(fixture["public_key_sha256_hex"]).upper()
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise CheckError(f"invalid public P5.5 protocol fixture: {error}") from error
+
+    if fixture.get("classification") != "TEST ONLY — NOT TRUSTED BY FIRMWARE":
+        raise CheckError("P5.5 protocol fixture must carry the TEST ONLY classification")
+    try:
+        test_public = bytes.fromhex(test_public_hex)
+    except ValueError as error:
+        raise CheckError("P5.5 test public key is not valid hexadecimal") from error
+    if len(test_public) != 65 or test_public[0] != 0x04:
+        raise CheckError("P5.5 test public key must be a 65-byte SEC1 point")
+    if hashlib.sha256(test_public).hexdigest().upper() != test_fingerprint:
+        raise CheckError("P5.5 test public-key fingerprint is inconsistent")
+    if test_key_id == P5_5_PRODUCTION_KEY_ID:
+        raise CheckError("P5.5 disposable test key must not use the production key ID")
+    if test_public_hex == P5_5_PRODUCTION_PUBLIC_KEY_HEX:
+        raise CheckError("P5.5 fixture must not use the production public key")
+
+    try:
+        trust_source = trust_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise CheckError(f"cannot inspect {P5_5_TRUST_HEADER}: {error}") from error
+    trust_byte_stream = "".join(re.findall(r"0x([0-9A-Fa-f]{2})", trust_source)).upper()
+    if test_public_hex in trust_byte_stream or str(test_key_id) in trust_source:
+        raise CheckError("P5.5 disposable test key leaked into the firmware trust table")
+    print("P5.5 key-material gate: OK (public test key is not firmware-trusted)")
+
+
 def check_repository(root: Path = ROOT) -> None:
     """Check protected files and scan tracked text without printing values."""
     tracked_files = _tracked_files(root)
@@ -189,11 +301,13 @@ def check_repository(root: Path = ROOT) -> None:
     print(f"app1 slot: {sizes['app1']:,} bytes")
     print("src/secrets.h tracked: no")
 
-    findings = _scan_tracked_secrets(root, tracked_files)
+    repository_files = sorted(set(tracked_files) | set(_untracked_files(root)))
+    findings = _scan_tracked_secrets(root, repository_files)
     if findings:
         detail = "\n".join(findings)
         raise CheckError(f"possible secrets found:\n{detail}")
-    print(f"tracked secret scan: OK ({len(tracked_files)} files)")
+    print(f"repository secret scan: OK ({len(repository_files)} files)")
+    _check_p5_5_key_material(root, repository_files)
 
     _git(
         root,

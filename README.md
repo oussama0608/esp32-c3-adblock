@@ -61,8 +61,9 @@ Printing notes:
 ## Build & flash (PlatformIO)
 
 Firmware recovery remains USB-only. After provisioning, an administrator can
-replace blocklist data manually from the authenticated LAN dashboard; remote URL
-fetching is deliberately disabled in P5.3a.
+replace blocklist data manually from the authenticated LAN dashboard, but P5.5
+accepts a new upload only when it carries a proof signed by the approved
+NetShield blocklist authority. Remote URL fetching remains deliberately disabled.
 
 > This checkout is validated with PlatformIO Core 6.1.19. `platformio.ini` pins
 > pioarduino 55.03.37 (Arduino-ESP32 3.3.7 / ESP-IDF 5.5.2). On Windows 10 x64,
@@ -77,6 +78,12 @@ cp src/secrets.example.h src/secrets.h
 
 # 2. build the blocklist hash table (maximum 104,857 hashes / 524,285 bytes)
 python3 tools/build_blocklist.py data/blocklist.bin
+
+# 2b. release authority only: create the detached 128-byte proof
+#     (the approved private key stays offline and outside this repository)
+python3 tools/sign_blocklist.py --list-id 1 --sequence <nonzero-release-sequence> \
+  --private-key <approved-private-key-path> --input data/blocklist.bin \
+  --output data/blocklist.sig
 
 # 3. initial firmware + blocklist filesystem flash (requires hardware approval)
 pio run -t upload
@@ -107,14 +114,19 @@ dashboard's **Forget Wi-Fi** action provides the same portal path without treati
 
 ## Blocklist updates and firmware recovery
 
-The authenticated dashboard at **http://c3adblock.local** exposes only manual
-blocklist upload. P5.3a compiles out URL configuration, scheduled fetching and
-the insecure remote transport. The device remains DEVELOPMENT-only; see
+The authenticated dashboard at **http://c3adblock.local** exposes only manual,
+signed blocklist upload. P5.3a compiles out URL configuration, scheduled fetching
+and the insecure remote transport; P5.5 authenticates the remaining ingress. The
+device remains DEVELOPMENT-only; see
 [SECURITY.md](SECURITY.md) before using it even on a test LAN.
 
 - **Blocklist** — build a sorted five-byte `blocklist.bin` no larger than 524,285
-  bytes and upload it through *Blocklist → Upload*. The previous valid list stays
-  active until the candidate is fully written, validated and promoted.
+  bytes and obtain its matching 128-byte `blocklist.sig` from the designated
+  signing authority. Select both files in *Blocklist → Upload*. The previous valid
+  list stays active until the proof and candidate are fully verified and promoted.
+  Existing unsigned lists remain boot-compatible for migration, but every new HTTP
+  upload must be signed. V1 deliberately permits replay of an older correctly
+  signed release and does not retain an active proof for boot-time attestation.
 - **Firmware** — firmware updates over the network are disabled in P5.1. Build a
   reviewed image locally and use the documented, approval-gated
   [Windows 10 USB recovery procedure](docs/USB_RECOVERY_WINDOWS.md).
@@ -152,7 +164,8 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 
 - ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
 - ✅ mDNS (`c3adblock.local`) for discovery
-- ⚠️ Manual blocklist upload remains DEVELOPMENT-only; remote fetch is disabled
+- ⚠️ Manual blocklist upload requires a signed proof but remains DEVELOPMENT-only;
+  remote fetch is disabled
 - 🛑 Firmware OTA over the network and the legacy browser installers are disabled in P5.1
 - ✅ Captive-portal WiFi setup (no hardcoded creds)
 - ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win

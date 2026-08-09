@@ -20,12 +20,13 @@ committed en `dce4672`; una persona confirmó verdes sus jobs `python-quality` y
 STA, panel y DNS. La limitación de potencia a 8,5 dBm queda documentada como un
 workaround observado en la ESP32-C3 SuperMini probada, no como requisito de
 todos los ESP32-C3. P5.2/P5.2a están confirmados únicamente para `bbeacda`; esa
-evidencia no se extrapola a P5.3a. Los demás controles de seguridad del
-dispositivo siguen pendientes. P5.3a deshabilita el fetch remoto de blocklists y convierte el
-upload manual en un reemplazo recuperable; estas reducciones no autentican el
-archivo ni convierten el dispositivo en apto para piloto.
+evidencia no se extrapola a entregas posteriores. Los demás controles de
+seguridad del dispositivo siguen pendientes. P5.3a deshabilita el fetch remoto de
+blocklists y convierte el upload manual en un reemplazo recuperable. P5.5 exige
+procedencia firmada a cada nuevo upload, pero no autentica permanentemente las
+listas legacy/en reposo ni convierte el dispositivo en apto para piloto.
 
-No se debe flashear la candidate P5.3a a una unidad piloto ni convertirla en DNS
+No se debe flashear la candidate P5.5 a una unidad piloto ni convertirla en DNS
 de una red real. Cualquier nuevo flash de laboratorio queda condicionado a sus
 gates, a [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) y a otra aprobación humana
 explícita.
@@ -43,9 +44,9 @@ explícita.
 
 1. P5.2/P5.2a ya superaron el HIL acordado de panel y recovery BOOT, pero el
    panel sigue sobre HTTP claro y una exposición WAN agravaría el impacto.
-2. P5.3a elimina el fetch HTTP/TLS configurable y hace recuperable el upload,
-   pero una blocklist manual todavía carece de firma/procedencia y necesita HIL
-   de corte de alimentación sobre LittleFS.
+2. P5.5 autentica la procedencia de nuevos uploads y mantiene el rollback de
+   P5.3a, pero todavía permite replay, conserva listas legacy unsigned y necesita
+   HIL de multipart y corte de alimentación sobre LittleFS.
 3. P5.2 sustituye los sinks DOM peligrosos, separa JavaScript y aplica escape
    contextual; el HIL funcional no sustituye un corpus XSS adversarial completo.
 4. El parser DNS, la asociación upstream, los límites de tasa y el heap no tienen
@@ -106,7 +107,7 @@ integridad de blocklist, TLS/SSRF, DNS o filesystem.
   no-cache, MIME, referrer y CSP.
 - En la baseline P5.2, `/upload`, `/fetchnow` y `/setupdate` quedaron detrás de
   estos controles de acceso. P5.3a conserva `/upload` y elimina las dos rutas
-  remotas; la autenticidad de blocklists sigue pendiente.
+  remotas; P5.5 exige además una firma autorizada para cada nuevo upload.
 
 ## Diseño de la candidate P5.3a
 
@@ -131,8 +132,9 @@ integridad de blocklist, TLS/SSRF, DNS o filesystem.
   imagen LittleFS conocida y validada, bajo aprobación humana separada.
 - Esta secuencia reduce TM-06/TM-13 y compila fuera la superficie de TM-08,
   TM-14 y TM-15 asociada al fetch. Las amenazas no se consideran cerradas sin CI
-  confirmada y HIL de cortes; el upload tampoco verifica todavía firma o
-  procedencia.
+  confirmada y HIL de cortes. En P5.3a el upload aún no verificaba firma o
+  procedencia; P5.5 añade ese gate de ingreso sin convertir las listas legacy en
+  contenido autenticado en reposo.
 - El request multipart completo admite como filtro temprano 4.096 B sobre el
   máximo del fichero; el límite streamed de 524.285 B sigue siendo definitivo.
   Cuerpos raw/urlencoded se rechazan con 415 sin abrir un candidato.
@@ -148,6 +150,42 @@ warnings corresponden a la comprobación remota de dependencias omitida por falt
 de Internet. `ci_checks repository`, los diff checks y el gate de archivos
 protegidos pasan localmente; CI real y HIL P5.3a siguen pendientes. No se
 autoriza flash ni piloto.
+
+## Diseño de la candidate P5.5
+
+- El firmware confía en una sola clave pública P-256 aprobada, con Key ID
+  `2173599637`, y acepta exclusivamente List ID `1`. La clave privada de
+  producción no existe en firmware, repositorio, tests ni CI.
+- La blocklist activa no cambia de formato. El proof separado tiene 128 bytes y
+  firma con ECDSA P-256/SHA-256 el manifest que contiene secuencia no nula,
+  longitud, recuento y SHA-256 del payload. La UI exige ambos ficheros y transmite
+  el proof como 256 caracteres hexadecimales en `X-Blocklist-Proof`.
+- Host, sesión y CSRF se comprueban antes de validar el proof. Un header ausente,
+  malformado, no autorizado o con firma inválida se rechaza antes de abrir
+  `/blocklist.new`. El candidato persistido se valida y autentica otra vez antes
+  y después de la promoción; los fallos conservan o restauran el last-known-good.
+- `/blocklist.new.auth` existe solo durante staging/promoción. El proof se elimina
+  antes que el candidato al descartar, permanece durante los dos renames y se
+  elimina mientras `/blocklist.old` aún permite rollback. Un candidate-only sin
+  proof válido nunca se recupera al arrancar.
+- Las listas active/old legacy unsigned siguen siendo boot-compatibles sin
+  migración escrita. P5.5 V1 permite deliberadamente replay de releases firmadas
+  anteriores, no guarda un sidecar activo ni añade anti-replay/NVS: es procedencia
+  de ingreso, no attestation permanente en reposo.
+- El signer host acepta la ruta de una clave P-256 por CLI, valida el blob,
+  construye el manifest exacto, exporta `r || s` fijo/low-S y escribe el proof
+  atómicamente. No incorpora, solicita ni imprime la clave privada de producción.
+- Fetch remoto y firmware OTA permanecen ausentes. El panel sigue sobre HTTP
+  claro; CI real, HIL multipart, fallos de LittleFS y cortes en cada frontera
+  siguen pendientes. Por ello P5.5 continúa **DEVELOPMENT-only** y PILOT es
+  **NO-GO**.
+
+La validación local P5.5 pasa 231 tests, Ruff, `ci_checks repository`, ambos diff
+checks y el gate de archivos protegidos. El build PlatformIO termina `SUCCESS`
+con 50.828 B de RAM y 1.127.265 B de flash enlazada. `firmware.bin` mide
+1.165.808 B, deja 210.448 B físicos y tiene SHA-256
+`67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
+Estas pruebas locales no equivalen a CI ejecutada en GitHub ni a HIL.
 
 ## Perfiles permitidos
 
