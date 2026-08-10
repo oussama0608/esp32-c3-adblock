@@ -519,3 +519,68 @@
   es `67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
   Frente a P5.4 aumenta 144 B RAM, 4.088 B enlazados y 4.448 B físicos. Esto no
   sustituye CI real ni HIL multipart/power-cut.
+
+## ADR-009 — P6.1 parser DNS acotado y correlación upstream síncrona
+
+- Fecha: 2026-08-10.
+- Estado: accepted; implementación y validación host/build locales completadas;
+  CI real y HIL pendientes.
+- Contexto: `NetworkUDP` mantiene un socket upstream no conectado, enlazado a un
+  puerto local efímero estable durante el boot. `parsePacket()` acepta un
+  datagrama de cualquier origen y `remoteIP()`/`remotePort()` solo describen el
+  último datagrama cargado. Una lectura parcial conserva su `rx_buffer` y hace
+  que posteriores `parsePacket()` devuelvan cero. El firmware anterior leía como
+  máximo 600 bytes, aceptaba el primer datagrama y no asociaba origen, puerto,
+  ID, QR ni pregunta.
+- Parser compartido: mover la lógica pura y sin Arduino a
+  `src/dns_protocol.cpp`. El firmware y `tests/native/test_dns_protocol.cpp`
+  compilan exactamente ese mismo fichero; no se valida seguridad mediante una
+  reimplementación Python ni solo con expresiones regulares.
+- Política estrecha: aceptar únicamente datagramas de hasta 600 bytes con header
+  y una pregunta completos, labels de 1 a 63 bytes, nombre DNS dentro del límite
+  de 253 caracteres, root terminator y QTYPE/QCLASS presentes. Rechazar de forma
+  explícita queries de respuesta, opcode no soportado, número de preguntas
+  distinto de uno, compression pointers en questions, truncado, labels
+  reservados y clase distinta de IN. No se añade soporte parcial de nombres
+  comprimidos, múltiples preguntas, TCP ni DNSSEC.
+- Correlación: conservar el ID del cliente, generar un ID upstream con
+  `esp_random()` y enviarlo solo después de parsear y decidir que la query está
+  permitida. Una respuesta solo puede ganar si procede exactamente del resolver
+  configurado en UDP/53, tiene QR de respuesta, opcode compatible, QDCOUNT uno,
+  el ID upstream esperado y una pregunta equivalente en QNAME, QTYPE y QCLASS.
+  Tras validar todo, se restaura el ID original antes de contestar al cliente.
+- UDP acotado: rechazar y limpiar sin lectura parcial cualquier query o respuesta
+  mayor de 600 bytes. Antes de enviar, eliminar el `rx_buffer` previo y drenar de
+  forma acotada hasta ocho datagramas. Durante la espera de 1.000 ms procesar como
+  máximo ocho candidatos; cada candidato inesperado se descarta y nunca se
+  reenvía. Alcanzar el presupuesto o el timeout falla esa consulta de forma
+  segura.
+- Concurrencia: conservar una única consulta upstream síncrona. No añadir tabla
+  de transacciones ni callbacks. Después de una espera upstream se cede el loop,
+  evitando encadenar hasta 16 timeouts y bloquear HTTP/BOOT durante unos 16 s.
+- Errores: comprobar `beginPacket()`, longitud de `write()` y `endPacket()`.
+  Query inválida, fallo de envío, respuesta no correlacionada o timeout no
+  producen una respuesta upstream falsa ni contaminan la consulta posterior.
+  La política exacta de respuesta local para malformed/timeout permanece
+  deliberadamente pequeña y se prueba como parte del protocolo.
+- Verificación: corpus nativo de bordes y respuestas correlacionadas/no
+  correlacionadas, 100.000 mutaciones ASan en el gate Windows y 1.000.000 con
+  ASan+UBSan y seed `0x4E534D` en Linux CI. La CI usa solamente el checkout ya
+  fijado y el compilador del runner; no usa red de pruebas ni dependencias de
+  producción nuevas.
+- Consecuencias: reduce TM-22 y TM-23 y evita el bloqueo concreto por datagramas
+  parcialmente leídos. Sigue siendo DNS UDP sin autenticación criptográfica:
+  un atacante on-path puede observar y competir con la respuesta real, y no se
+  añaden DNSSEC, DoT o DoH. La resistencia a spoofing real, timeout, ráfaga y
+  carga debe validarse con upstream controlado en HIL. Hasta confirmar la CI de
+  la revisión exacta y ese HIL, TM-22/TM-23 no se consideran `CLOSED` y PILOT
+  permanece **NO-GO**.
+- Validación local: 246 tests pytest aprobados. El harness real compilado con
+  MSVC AddressSanitizer ejecutó además 1.000.000 de mutaciones, seed `0x4E534D`,
+  2.000.169 checks y checksum `0x6EC04F`, sin findings. Ruff, los checks de diff,
+  `ci_checks repository/workflow` y los archivos protegidos pasan. PlatformIO
+  termina `SUCCESS`: RAM 51.420 B, flash enlazada 1.129.779 B, margen enlazado
+  246.477 B, `firmware.bin` 1.168.720 B, margen físico 207.536 B y SHA-256
+  `EE75C250AE7BA1D922FF6F448AB2A360E62872E34F044EB2951625544C565BB8`.
+  Frente a P5.5 son +592 B RAM, +2.514 B enlazados y +2.912 B físicos. El job
+  Linux ASan/UBSan está definido, pero no se afirma ejecutado hasta GitHub.

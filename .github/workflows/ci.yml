@@ -61,6 +61,37 @@ jobs:
           git diff --check
           git diff --exit-code
 
+  dns-native-sanitizers:
+    name: DNS native sanitizers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build production DNS parser with ASan and UBSan
+        run: |
+          set -euo pipefail
+          mkdir -p .native-build
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc src/dns_protocol.cpp tests/native/test_dns_protocol.cpp \
+            -o .native-build/dns_protocol_tests
+
+      - name: Run deterministic DNS corpus and one million mutations
+        env:
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: >-
+          ./.native-build/dns_protocol_tests
+          --iterations 1000000
+          --seed 0x4E534D
+
   firmware-build:
     name: Firmware build
     runs-on: windows-2022

@@ -47,8 +47,9 @@ otras superficies históricas como si siguieran implementadas.
 
 Los 47 tests pytest de P2 cubren el generador Python de blocklists y la baseline
 completa anterior a P5.2 suma 67 resultados aprobados con los gates P5.1. P5.2
-añade 32 gates estáticos y la suite local completa termina con 99 aprobados. No
-hay todavía harness C++ del firmware, fuzzing del parser DNS ni tests de
+añade 32 gates estáticos y la suite local completa termina con 99 aprobados. P6.1
+añade un harness C++ del parser/correlador DNS y mutaciones deterministas bajo
+sanitizers; su CI real y HIL siguen pendientes. Tampoco hay todavía tests de
 navegador para el panel P5.2. Sí existe HIL funcional end-to-end de `dce4672`.
 
 ## Método de clasificación
@@ -295,6 +296,39 @@ con 210.448 B físicos libres. Su SHA-256 es
 `67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
 Frente a P5.4 aumenta 144 B RAM, 4.088 B enlazados y 4.448 B físicos. CI real y
 HIL siguen pendientes.
+
+### Delta P6.1 — parser acotado y correlación upstream
+
+P6.1 conserva UDP/53, Quad9, el buffer máximo de 600 bytes y una única consulta
+upstream síncrona. La lógica pura pasa a `src/dns_protocol.cpp`, que también
+compila directamente el harness nativo. Queries y respuestas se validan con
+límites explícitos antes de cualquier decisión o forward; preguntas comprimidas,
+truncadas, de clase no IN, con opcode no soportado o con QDCOUNT distinto de uno
+se rechazan en lugar de interpretarse parcialmente.
+
+Para una query permitida, el firmware conserva el ID del cliente, usa un ID
+upstream generado por el dispositivo y solo acepta un datagrama cuyo origen sea
+el resolver configurado en puerto 53 y cuyo ID, QR, opcode, QDCOUNT, QNAME,
+QTYPE y QCLASS correspondan al contexto guardado. El ID del cliente solo se
+restaura después de validar la respuesta completa. Los datagramas stale o falsos
+se limpian y el firmware continúa dentro de un timeout de 1.000 ms y un máximo
+de ocho candidatos.
+
+La API `NetworkUDP` conserva un `rx_buffer` tras una lectura parcial y bloquea
+las recepciones siguientes. P6.1 evita esa condición: un datagrama superior a
+600 bytes se descarta completo mediante `clear()`, y una lectura aceptada debe
+consumir exactamente el tamaño anunciado. Antes de cada envío se limpia el
+buffer previo y se drena la cola con un presupuesto de ocho datagramas; si el
+presupuesto se agota, la consulta falla sin enviar o aceptar datos no asociados.
+
+Los tests permanentes ejecutan corpus determinista, bordes y mutaciones sobre el
+mismo código C++ de producción. El gate pytest de Windows ejecuta 100.000
+mutaciones con ASan y la validación local adicional completó 1.000.000; el job
+Linux definido para CI ejecuta 1.000.000 con ASan+UBSan y seed `0x4E534D`.
+La mera presencia del job no acredita una ejecución real. También siguen
+pendientes el HIL con upstream UDP controlado, la carga/timeout en la placa y la
+regresión A/AAAA. TM-22 y TM-23 pasan como máximo a candidatas a `MITIGATED`, no
+a `CLOSED`, hasta disponer de CI real confirmada y HIL.
 
 ## Registro detallado
 
@@ -990,29 +1024,39 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 - **ID:** TM-22.
 - **Activo afectado:** memoria, corrección DNS y disponibilidad.
 - **Atacante requerido:** cualquier cliente que pueda enviar UDP/53 al ESP.
-- **Superficie:** `parseQuery()`, `buildBlocked()` y `handleDns()` en
-  `src/main.cpp:144-185`, con buffer global de 600 bytes.
-- **Escenario:** headers con QR/opcode/QDCOUNT/QCLASS inválidos, múltiples
-  preguntas, nombres truncados o datagramas mayores de 600 B se procesan
-  parcialmente. Compression pointers y EDNS también pueden ser DNS válido no
-  soportado y deben rechazarse explícitamente, no confundirse con malformado.
-- **Impacto:** bypass, respuesta incorrecta o loop bloqueado. Corrupción de
-  memoria es una hipótesis a confirmar con fuzzing, no un exploit demostrado.
+- **Superficie:** `parseClientQuery()` en `src/dns_protocol.cpp`, más
+  `buildBlocked()` y `handleDns()` en `src/main.cpp`, con buffers acotados a 600
+  bytes.
+- **Escenario:** un cliente envía header, pregunta, label o terminador truncado;
+  QDCOUNT/opcode/QCLASS no soportado; compression pointer; o un datagrama mayor
+  que el buffer para provocar lectura parcial, interpretación ambigua o bloqueo
+  de `NetworkUDP`.
+- **Impacto:** bypass, respuesta incorrecta, agotamiento o loop DNS bloqueado.
+  Corrupción de memoria era una hipótesis de P4 y se comprueba ahora con harness
+  nativo, no se presupone imposible por inspección.
 - **Probabilidad:** Alta; no requiere autenticación.
 - **Severidad:** HIGH.
-- **Controles actuales:** mínimo de 13 bytes, rechazo de punteros de compresión,
-  límites básicos de nombre y comprobaciones de final de buffer.
-- **Controles ausentes:** validación completa de header, una pregunta IN,
-  terminación exacta, política de tipos/EDNS/truncado y rechazo sin forward.
-- **Corrección propuesta:** parser total y fail-closed con offsets comprobados;
-  respuesta FORMERR/NOTIMP o descarte documentado, nunca forward de parse fallido.
+- **Controles actuales:** P6.1 usa un parser C++ compartido y sin Arduino con
+  bounds checks antes de cada lectura, una pregunta IN, labels de 1–63 bytes,
+  nombre de hasta 253 caracteres, terminación y QTYPE/QCLASS completos. Rechaza
+  QR/opcode/QDCOUNT inválidos, pointers en questions, truncado y datagramas
+  mayores de 600 B; estos últimos se limpian sin lectura parcial. Una query
+  inválida nunca alcanza la decisión de blocklist ni el upstream.
+- **Controles ausentes:** DNS sobre TCP, DNSSEC, parsing general de EDNS,
+  múltiples preguntas y nombres comprimidos en questions; son límites
+  deliberados, no entradas aceptadas parcialmente. CI real y HIL de UDP/carga
+  no se han confirmado.
+- **Corrección propuesta:** conservar el parser total y fail-closed y no ampliar
+  el subconjunto hasta añadir vectores y presupuesto específico.
 - **Test necesario:** harness C++ host con corpus de longitudes 0-12, QNAME sin
   cero, labels 63/64, pointers, QDCOUNT 0/2, QR, opcode, clase, EDNS y >600 B;
   fuzzing con ASan/UBSan en host.
 - **Condición de aceptación:** todo input inválido tiene resultado determinista y
   no se reenvía. El corpus más un millón de casos con seed `0x4E534D`, máximo 100
   ms/caso y ASan/UBSan termina sin crash, hang, OOB ni sanitizer finding; la seed
-  y todo caso que falle quedan guardados como regresión.
+  y todo caso que falle quedan guardados como regresión. El job GitHub exacto y
+  el HIL en la SuperMini deben confirmarse antes de cambiar el estado a
+  `MITIGATED`; cierre exige además carga y compatibilidad del subconjunto.
 
 ### TM-23 — Respuestas upstream no asociadas
 
@@ -1020,24 +1064,36 @@ mínima reduce flash pero ata el producto a host, rotación y tiempo concretos.
 - **Activo afectado:** autenticidad y corrección de respuestas DNS permitidas.
 - **Atacante requerido:** actor capaz de inyectar UDP hacia el puerto efímero o
   respuesta tardía de una consulta anterior.
-- **Superficie:** `forwardUpstream()` en `src/main.cpp:160-164`.
-- **Escenario:** el ESP acepta el primer datagrama recibido sin comprobar IP,
-  puerto, transaction ID, QR ni pregunta; una respuesta falsa/tardía se entrega
-  al cliente actual.
+- **Superficie:** `forwardUpstream()` en `src/main.cpp` y el correlador puro de
+  `src/dns_protocol.cpp`.
+- **Escenario:** un datagrama falso o tardío compite con Quad9 e intenta hacerse
+  pasar por la respuesta de la consulta síncrona actual, o queda en el socket
+  para contaminar la consulta siguiente.
 - **Impacto:** DNS spoofing, phishing, bloqueo o respuesta cruzada entre clientes.
 - **Probabilidad:** Media.
 - **Severidad:** HIGH.
-- **Controles actuales:** un único request síncrono, conserva el ID original y
-  aplica timeout de un segundo.
-- **Controles ausentes:** asociación completa, drenaje de respuestas tardías,
-  validación de origen/puerto/ID/pregunta y manejo de truncado.
-- **Corrección propuesta:** mantener contexto de la consulta y descartar hasta
-  que coincidan `9.9.9.9:53`, ID, QR, QNAME, QTYPE y QCLASS; limpiar cola al
-  iniciar/terminar.
+- **Controles actuales:** P6.1 mantiene una sola consulta, genera un ID upstream
+  separado, conserva el ID cliente y exige origen igual al resolver configurado,
+  puerto 53, ID, QR, opcode, QDCOUNT y pregunta QNAME/QTYPE/QCLASS completos.
+  Solo entonces restaura el ID cliente. Drena como máximo ocho paquetes stale,
+  examina como máximo ocho candidatos y aplica timeout wrap-safe de 1.000 ms.
+  Cada paquete inválido/oversized se descarta completo y los retornos de envío se
+  comprueban.
+- **Controles ausentes:** autenticación criptográfica del DNS UDP, DNSSEC y
+  protección contra un atacante on-path que observa la query y puede competir.
+  Tampoco existe todavía evidencia HIL del socket real ni CI real confirmada.
+- **Corrección propuesta:** mantener la asociación estricta y no aceptar una
+  respuesta por ID solamente. DoT/DoH o DNSSEC requerirían una fase y presupuesto
+  separados.
 - **Test necesario:** upstream UDP falso que primero envíe origen, puerto, ID,
-  pregunta y QR incorrectos, además de respuesta tardía tras timeout.
+  pregunta y QR incorrectos, además de stale, múltiples candidatos y respuesta
+  tardía tras timeout; repetirlo después en HIL con un upstream controlado.
 - **Condición de aceptación:** solo una respuesta plenamente asociada se devuelve
-  al cliente; las demás se descartan sin contaminar la consulta siguiente.
+  al cliente; las demás se descartan sin contaminar la consulta siguiente. El
+  corpus y un millón de mutaciones terminan sin sanitizer finding, GitHub CI se
+  confirma para la revisión exacta y HIL demuestra los mismos casos sin reset ni
+  starvation sostenida. Hasta entonces permanece `OPEN`, candidata a
+  `MITIGATED`.
 
 ### TM-24 — Pérdida de Wi-Fi sin recuperación controlada
 
@@ -1339,6 +1395,7 @@ el rate limiting general.
 | **P5.6** | D: transporte HTTPS verificado, redirects y política SSRF; la firma P5.5 seguiría siendo obligatoria | TM-08, TM-14, TM-15 | Fetch remoto sigue compilado fuera si el coste/ciclo CA no es aceptable. |
 | **P5.7** | Portal físico/temporal, NVS/FS endurecidos, reconexión y recovery probado | TM-10 a TM-12, TM-24, TM-25, TM-30 | Bloqueante de PILOT. |
 | **P5.8** | Parser DNS, asociación upstream, cuotas y presupuesto de heap | TM-20 a TM-23 | Bloqueante de PILOT y requiere fuzz/HIL. |
+| **P6.1** | Subconjunto P5.8: parser DNS acotado, ID separado y asociación upstream estricta | TM-22, TM-23 | Implementación y harness host; CI ASan/UBSan real y HIL con upstream controlado pendientes. |
 | **P5.9** | Firma, boot confirmation y anti-downgrade si se decide reabrir OTA | TM-26, TM-27 | Opcional para PILOT solo si OTA permanece ausente; obligatorio para reactivarla. |
 | **P5.10** | Redacción de logs, privacidad, expiración, soak y checklist anti-WAN | TM-02, TM-28, TM-29 | Cierre de gate PILOT. |
 
@@ -1400,7 +1457,11 @@ Mínimo antes de instalarlo a otra persona:
   OTA/RF/archivos protegidos; la suite local completa termina con 99 aprobados;
 - añadir harness C++ nativo para validadores, parser DNS, serialización JSON y
   asociación de respuestas;
-- fuzzing reproducible del parser con ASan/UBSan en host;
+- P6.1 implementa el primer harness C++ sobre el mismo parser/correlador de
+  producción: 100.000 mutaciones ASan en Windows y un job Linux preparado para
+  1.000.000 con ASan/UBSan y seed `0x4E534D`; la ejecución GitHub sigue
+  pendiente;
+- ampliar después el harness nativo a serialización JSON y otros validadores;
 - adapters falsos para LittleFS, NVS, HTTP, reloj y Wi-Fi con fault injection;
 - tests DOM en HTML local para payloads XSS y matriz de rutas/métodos/auth/CSRF;
 - builds limpios DEVELOPMENT y PILOT, inspección de ELF/map/strings, tamaño de
@@ -1415,7 +1476,10 @@ Mínimo antes de instalarlo a otra persona:
   Host IP/mDNS/puerto/rebinding; CSRF/métodos; corpus XSS en navegador y heap de
   PBKDF2;
 - ausencia de `/update` y servicio ArduinoOTA; regresión DNS/panel;
-- corpus DNS, upstream falso, carga, pérdida/reconexión Wi-Fi y heap mínimo;
+- P6.1: upstream UDP controlado con respuesta válida, origen/puerto/ID/pregunta
+  falsos, stale, timeout y ráfaga; A/AAAA, queries bloqueadas sin upstream,
+  disponibilidad de panel/BOOT y heap mínimo;
+- carga DNS y pérdida/reconexión Wi-Fi;
 - onboarding hostil con SSID malicioso, timeout y presencia física;
 - blocklist real dentro del máximo transaccional y cortes de alimentación en
   cada fase de escritura/boot;
@@ -1434,6 +1498,7 @@ Mínimo antes de instalarlo a otra persona:
 | P5.2 combinado, medido localmente | 1.291.104/1.376.256 B físicos; 85.152 B (83,16 KiB) libres; 1.249.513 B enlazados | 51.292/327.680 B estáticos; pico PBKDF2 aún debe medirse en HIL |
 | P5.3a manual-only, medido localmente | 1.160.704/1.376.256 B físicos; 215.552 B libres; 1.122.703 B enlazados | 50.684/327.680 B estáticos; heap dinámico pendiente de HIL |
 | P5.5 procedencia de blocklist, medido localmente | 1.165.808/1.376.256 B físicos; 210.448 B libres; 1.127.265 B enlazados | 50.828/327.680 B estáticos; pico ECDSA/FS pendiente de HIL |
+| P6.1 parser/correlación DNS, medido localmente | 1.168.720/1.376.256 B físicos; 207.536 B libres; 1.129.779 B enlazados | 51.420/327.680 B estáticos; dos buffers globales acotados de 600 B; stack/heap dinámico pendientes de HIL |
 | P5.6 D | transporte +2 a +15 KiB con CA mínima; sección bundle 68.987 B, delta real y coste firma desconocidos | pico dinámico TLS no medido hasta HIL |
 
 No se inventa todavía un límite comercial adicional al slot físico. Cada parche

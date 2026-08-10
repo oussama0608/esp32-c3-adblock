@@ -343,6 +343,64 @@ SHA-256 `67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
 Frente a P5.4 son +144 B RAM, +4.088 B enlazados y +4.448 B físicos. La CI real
 y todo HIL P5.5 siguen pendientes.
 
+## P6.1 — parser DNS acotado y correlación upstream
+
+P6.1 separa la lógica pura de protocolo en `src/dns_protocol.cpp` para que el
+firmware y el harness nativo ejecuten exactamente el mismo parser y las mismas
+reglas de correlación. El transporte sigue siendo UDP, síncrono y con una sola
+consulta upstream pendiente; no se añade tabla asíncrona, DNS-over-TLS,
+DNS-over-HTTPS ni un cambio de resolver.
+
+Los gates permanentes de esta entrega cubren:
+
+- datagramas cliente y upstream limitados a 600 bytes, sin lecturas parciales
+  que dejen bloqueado el `rx_buffer` de `NetworkUDP`;
+- header de query, una única pregunta, labels y longitud total acotados, root
+  terminator presente y rechazo explícito de compression pointers en la
+  pregunta;
+- respuestas truncadas o malformadas y diferencias de QR, opcode, QDCOUNT,
+  transaction ID, QNAME, QTYPE o QCLASS;
+- origen UDP exactamente igual al upstream configurado y puerto remoto 53,
+  comprobados inmediatamente después de `parsePacket()`;
+- transaction ID upstream generado por el dispositivo y restauración del ID del
+  cliente solamente después de validar la respuesta completa;
+- drenaje acotado de datagramas anteriores, máximo acotado de candidatos durante
+  la espera y timeout wrap-safe de 1.000 ms;
+- comprobación de `beginPacket()`, `write()` y `endPacket()`, limpieza de cada
+  datagrama rechazado y ausencia de forward para queries inválidas o bloqueadas;
+- conservación del modelo síncrono, cediendo el loop después de una consulta
+  permitida para no encadenar hasta 16 esperas upstream;
+- corpus determinista para respuesta válida, origen/puerto/ID/pregunta
+  incorrectos, query truncada, label de 64 bytes, terminador ausente,
+  compression pointers, stale antes de válida, múltiples candidatos falsos y
+  timeout;
+- mutaciones deterministas de longitudes y bytes, sin dependencias nuevas ni
+  tráfico de red.
+
+`tests/test_p6_1_dns.py` compila en Windows el código de producción junto a
+`tests/native/test_dns_protocol.cpp` y ejecuta el corpus más 100.000 mutaciones
+con AddressSanitizer. El job Linux `dns-native-sanitizers` compila esos mismos
+dos ficheros con ASan y UBSan, y ejecuta 1.000.000 de mutaciones con seed fija
+`0x4E534D`. La presencia del job en YAML no demuestra que GitHub Actions haya
+pasado: la ejecución real de los tres jobs y su confirmación humana siguen
+pendientes.
+
+También queda pendiente HIL con un upstream UDP controlado: respuesta correcta,
+origen/puerto/ID/pregunta falsos antes de la correcta, respuesta tardía tras
+timeout, caída de upstream, ráfaga hostil, A/AAAA permitidos y consultas
+bloqueadas sin tráfico upstream. Debe registrarse además que dashboard y BOOT
+siguen respondiendo durante fallos DNS. Hasta esa evidencia, TM-22 y TM-23 son
+como máximo candidatas a `MITIGATED`, no `CLOSED`.
+
+Validación local P6.1: la suite completa termina con 246 tests aprobados. El gate
+pytest ejecuta 100.000 mutaciones bajo MSVC ASan; una ejecución adicional de
+release completó 1.000.000, seed `0x4E534D`, 2.000.169 checks y checksum
+`0x6EC04F`, sin findings. Ruff, los checks de diff, `ci_checks` y los archivos
+protegidos pasan. El build PlatformIO termina `SUCCESS`: RAM 51.420 B, flash
+enlazada 1.129.779 B, `firmware.bin` 1.168.720 B, margen físico 207.536 B y
+SHA-256 `EE75C250AE7BA1D922FF6F448AB2A360E62872E34F044EB2951625544C565BB8`.
+La ejecución Linux ASan/UBSan y todo HIL P6.1 siguen pendientes.
+
 ## Integración continua — implementado en P3
 
 `.github/workflows/ci.yml` valida los pushes y pull requests dirigidos a `main`
@@ -365,6 +423,14 @@ La fixture automática de pytest bloquea `urlopen` en el generador y la única
 descarga simulada usa bytes locales. Esto evita descargas deliberadas de
 blocklists, pero no constituye un sandbox general de red para el runner.
 
+P6.1 añade el job Linux `dns-native-sanitizers`, sin credenciales, servicios ni
+descargas de datos. Reutiliza el checkout fijado por SHA, usa el `g++` incluido
+en `ubuntu-24.04` y compila directamente `src/dns_protocol.cpp` con
+`tests/native/test_dns_protocol.cpp`. El ejecutable se construye con
+AddressSanitizer y UndefinedBehaviorSanitizer y procesa un corpus determinista
+más 1.000.000 de mutaciones con seed `0x4E534D`. El job no sustituye el build
+PlatformIO ni el HIL de sockets UDP reales.
+
 El job `firmware-build` usa Python 3.13.12 y PlatformIO Core 6.1.19. Conserva
 exactamente la plataforma ESP32 fijada en P1, almacena `PLATFORMIO_CORE_DIR`
 dentro del workspace, genera una blocklist de 35 bytes exclusivamente desde las
@@ -384,14 +450,14 @@ pero no sustituye una auditoría especializada.
 
 ## Integración continua — pendiente
 
-- ejecución real de P5.3a en GitHub y confirmación humana de ambos jobs para su
-  revisión exacta;
+- ejecución real de P6.1 en GitHub y confirmación humana de los tres jobs para su
+  revisión exacta, incluido ASan/UBSan Linux;
 - decidir si los checks serán obligatorios mediante branch protection;
 - mantener pruebas de Windows 10 real, hardware, red, DNS y panel ya enumeradas.
 
-Las ejecuciones verdes confirmadas de `dce4672` y `bbeacda` validan únicamente
-esas revisiones. La inspección estructural o el parseo local del YAML tampoco
-acreditan P5.3a.
+Las ejecuciones verdes confirmadas de revisiones anteriores validan únicamente
+sus commits exactos. La inspección estructural o el parseo local del YAML no
+acreditan P6.1 ni sustituye su ejecución en GitHub.
 
 ## Python — implementado en P2
 
@@ -429,14 +495,16 @@ acreditan P5.3a.
 - validación de procedencia, revisión y autenticidad de fuentes reales, sin
   convertir las descargas de Internet en requisito de pytest.
 
-## DNS — pendiente
+## DNS — implementado parcialmente en P6.1
 
-- A, AAAA y EDNS;
-- paquetes truncados o inválidos;
-- compression pointers;
-- múltiples preguntas;
-- tipos no soportados;
-- fuzz básico.
+- parser y correlación P6.1 cubiertos por corpus nativo y mutaciones
+  deterministas bajo sanitizers;
+- A y AAAA conservan el comportamiento previo en los gates host; falta su HIL;
+- se admite un único OPT EDNS0 acotado; compression pointers en questions y
+  múltiples preguntas se rechazan, QTYPE 0 es inválido y los demás QTYPE no
+  cero se reenvían;
+- quedan pendientes DNS sobre TCP, DNSSEC, respuestas mayores de 600 bytes,
+  compatibilidad amplia de EDNS y fuzzing continuo/coverage-guided.
 
 ## Integración — pendiente
 

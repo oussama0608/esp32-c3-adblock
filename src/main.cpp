@@ -23,6 +23,7 @@ extern "C" {
 #include <mbedtls/platform_util.h>
 #include <mbedtls/sha256.h>
 #include "blocklist_trust.h"
+#include "dns_protocol.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_VERBOSE
@@ -77,14 +78,21 @@ static const uint32_t WIFI_ASSOCIATION_TIMEOUT_MS = 20000;
 static const uint32_t WIFI_DISCONNECT_TIMEOUT_MS = 100;
 static const uint32_t WIFI_RETRY_SETTLE_MS = 250;
 
+using dns_protocol::DNS_PACKET_MAX_BYTES;
+using dns_protocol::DNS_RESPONSE_CANDIDATE_MAX;
+using dns_protocol::DNS_STALE_DRAIN_MAX;
+using dns_protocol::DNS_UPSTREAM_TIMEOUT_MS;
+
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
-uint8_t buf[600];
+uint8_t buf[DNS_PACKET_MAX_BYTES];
+uint8_t upstreamBuf[DNS_PACKET_MAX_BYTES];
 bool networkServicesStarted = false;
 bool blocklistHealthy = false;
+bool upstreamSocketReady = false;
 
 [[noreturn]] static void enterStorageFailClosed(const char* reason);
 
@@ -555,25 +563,102 @@ static Dev* getClient(uint32_t ip) {
 }
 
 // ---------- DNS ----------
-static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype, int* qend) {
-  if (len < 13) return 0; int i = 12; size_t o = 0;
-  while (i < len) { uint8_t l = pkt[i++]; if (l == 0) break; if (l & 0xC0) return 0;
-    if (o + l + 1 >= 250 || i + l > len) return 0; if (o) out[o++] = '.';
-    for (uint8_t k = 0; k < l; k++) out[o++] = tolower(pkt[i++]); }
-  out[o] = 0; if (i + 4 > len) return 0; *qtype = (pkt[i] << 8) | pkt[i + 1]; *qend = i + 4;
-  if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
-  return o;
+static int buildBlocked(int qlen, const dns_protocol::QueryInfo& query) {
+  return static_cast<int>(dns_protocol::buildBlockedResponse(
+      buf, static_cast<size_t>(qlen), query, buf, sizeof(buf)));
 }
-static int buildBlocked(int qend, uint16_t qtype) {
-  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == 1) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
-  if (qtype != 1) return qend;
-  const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
-  memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+
+static int buildDnsError(int qlen, const dns_protocol::QueryInfo* query,
+                         dns_protocol::ResponseCode code) {
+  return static_cast<int>(dns_protocol::buildErrorResponse(
+      buf, static_cast<size_t>(qlen), query, code, buf, sizeof(buf)));
 }
+
 static int forwardUpstream(int qlen) {
-  upstreamCli.beginPacket(UPSTREAM, 53); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-  uint32_t t0 = millis();
-  while (millis() - t0 < 1000) { int sz = upstreamCli.parsePacket(); if (sz > 0) return upstreamCli.read(buf, sizeof(buf)); delay(1); }
+  dns_protocol::QueryInfo query = {};
+  if (!upstreamSocketReady ||
+      dns_protocol::parseClientQuery(buf, static_cast<size_t>(qlen), &query) !=
+          dns_protocol::QueryStatus::VALID) {
+    return 0;
+  }
+
+  // NetworkUDP refuses to parse a new datagram while a partially-read RX
+  // buffer exists. Clear that state, then require an observed empty queue
+  // within the bounded stale-packet budget before sending a new transaction.
+  upstreamCli.clear();
+  bool queueObservedEmpty = false;
+  for (uint8_t drained = 0; drained < DNS_STALE_DRAIN_MAX; ++drained) {
+    const int staleSize = upstreamCli.parsePacket();
+    if (staleSize <= 0) {
+      queueObservedEmpty = true;
+      break;
+    }
+    upstreamCli.clear();
+  }
+  if (!queueObservedEmpty) return 0;
+
+  const uint16_t upstreamId = static_cast<uint16_t>(esp_random());
+  if (upstreamCli.beginPacket(UPSTREAM, DNS_PORT) != 1) return 0;
+  if (!dns_protocol::setTransactionId(
+          buf, static_cast<size_t>(qlen), upstreamId)) {
+    return 0;
+  }
+  const size_t bytesWritten = upstreamCli.write(buf, static_cast<size_t>(qlen));
+  const bool idRestored = dns_protocol::setTransactionId(
+      buf, static_cast<size_t>(qlen), query.clientId);
+  if (!idRestored || bytesWritten != static_cast<size_t>(qlen) ||
+      upstreamCli.endPacket() != 1) {
+    return 0;
+  }
+
+  const uint32_t deadline = millis() + DNS_UPSTREAM_TIMEOUT_MS;
+  uint8_t candidates = 0;
+  while (static_cast<int32_t>(deadline - millis()) > 0 &&
+         candidates < DNS_RESPONSE_CANDIDATE_MAX) {
+    const int packetSize = upstreamCli.parsePacket();
+    if (packetSize <= 0) {
+      delay(1);
+      continue;
+    }
+    ++candidates;
+
+    // Capture peer metadata before any later beginPacket() can overwrite it.
+    const IPAddress sourceIp = upstreamCli.remoteIP();
+    const uint16_t sourcePort = upstreamCli.remotePort();
+    if (packetSize > static_cast<int>(DNS_PACKET_MAX_BYTES)) {
+      upstreamCli.clear();
+      continue;
+    }
+
+    dns_protocol::Ipv4Endpoint actualEndpoint = {
+        {sourceIp[0], sourceIp[1], sourceIp[2], sourceIp[3]}, sourcePort};
+    const dns_protocol::Ipv4Endpoint expectedEndpoint = {
+        {UPSTREAM[0], UPSTREAM[1], UPSTREAM[2], UPSTREAM[3]}, DNS_PORT};
+    if (!dns_protocol::endpointMatches(actualEndpoint, expectedEndpoint)) {
+      upstreamCli.clear();
+      continue;
+    }
+
+    const int received = upstreamCli.read(
+        upstreamBuf, static_cast<size_t>(packetSize));
+    if (received != packetSize) {
+      upstreamCli.clear();
+      continue;
+    }
+    if (dns_protocol::validateUpstreamResponse(
+            buf, static_cast<size_t>(qlen), query, upstreamBuf,
+            static_cast<size_t>(received), upstreamId) !=
+        dns_protocol::ResponseStatus::VALID) {
+      continue;
+    }
+
+    memcpy(buf, upstreamBuf, static_cast<size_t>(received));
+    if (!dns_protocol::setTransactionId(
+            buf, static_cast<size_t>(received), query.clientId)) {
+      return 0;
+    }
+    return received;
+  }
   return 0;
 }
 // Drain a whole RX burst per call (capped, so the web server still gets a turn) instead of
@@ -582,20 +667,68 @@ static bool handleDns() {
   if (!blocklistHealthy) enterStorageFailClosed("runtime blocklist unavailable");
   bool did = false;
   for (int budget = 0; budget < 16; budget++) {
-    int sz = dnsServer.parsePacket(); if (sz <= 0) break;
+    const int sz = dnsServer.parsePacket(); if (sz <= 0) break;
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
-    char domain[256]; uint16_t qtype = 0; int qend = qlen;
-    size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+    if (sz > static_cast<int>(DNS_PACKET_MAX_BYTES)) {
+      dnsServer.clear();
+      continue;
+    }
+    const int qlen = dnsServer.read(buf, static_cast<size_t>(sz));
+    if (qlen != sz) {
+      dnsServer.clear();
+      continue;
+    }
+
+    dns_protocol::QueryInfo query = {};
+    const dns_protocol::QueryStatus queryStatus =
+        dns_protocol::parseClientQuery(
+            buf, static_cast<size_t>(qlen), &query);
+    if (queryStatus == dns_protocol::QueryStatus::DROP) continue;
+    if (queryStatus != dns_protocol::QueryStatus::VALID) {
+      const dns_protocol::QueryInfo* completeQuestion =
+          query.questionEnd >= dns_protocol::DNS_HEADER_BYTES &&
+                  query.questionEnd <= static_cast<size_t>(qlen)
+              ? &query
+              : nullptr;
+      const int errorLength = buildDnsError(
+          qlen, completeQuestion,
+          dns_protocol::responseCodeFor(queryStatus));
+      if (errorLength > 0) {
+        dnsServer.beginPacket(cip, cport);
+        dnsServer.write(buf, static_cast<size_t>(errorLength));
+        dnsServer.endPacket();
+      }
+      continue;
+    }
+
+    const char* domain = query.blocklistName;
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
-    bool blocked = ban || (dl && numHashes && isBlocked(domain));
+    bool blocked = ban || (!query.root && query.blocklistNameLength &&
+                           numHashes && isBlocked(domain));
     if (!blocklistHealthy) enterStorageFailClosed("runtime blocklist read failed");
-    int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else         { rlen = forwardUpstream(qlen);     totalAllowed++; if (c) c->allowed++; }
-    if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    int rlen = 0;
+    if (blocked) {
+      rlen = buildBlocked(qlen, query);
+      totalBlocked++;
+      if (c) c->blocked++;
+    } else {
+      rlen = forwardUpstream(qlen);
+      if (rlen > 0) {
+        totalAllowed++;
+        if (c) c->allowed++;
+      } else {
+        rlen = buildDnsError(
+            qlen, &query, dns_protocol::ResponseCode::SERVER_FAILURE);
+      }
+    }
+    if (rlen > 0) {
+      dnsServer.beginPacket(cip, cport);
+      dnsServer.write(buf, static_cast<size_t>(rlen));
+      dnsServer.endPacket();
+    }
+    if (!blocked) break;  // At most one synchronous upstream wait per loop turn.
   }
   return did;
 }
@@ -1942,7 +2075,8 @@ void setup() {
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  dnsServer.begin(DNS_PORT);
+  upstreamSocketReady = upstreamCli.begin(0) != 0;
   web.on("/login", HTTP_GET, handleLoginGet);
   web.on("/login", HTTP_POST, handleLoginPost);
   web.on("/logout", HTTP_POST, handleLogout);
