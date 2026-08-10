@@ -588,7 +588,7 @@ void testResponseBuilders() {
 
   const size_t blockedLength = dp::buildBlockedResponse(
       query.data(), query.size(), info, output.data(), output.size());
-  CHECK(blockedLength == info.questionEnd + 16);
+  CHECK(blockedLength == static_cast<size_t>(info.questionEnd) + 16U);
   CHECK(readU16(output, 0) == info.clientId);
   CHECK(readU16(output, 4) == 1);
   CHECK(readU16(output, 6) == 1);
