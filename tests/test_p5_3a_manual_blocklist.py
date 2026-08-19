@@ -646,9 +646,7 @@ def test_recovery_and_promotion_use_active_candidate_and_backup_paths() -> None:
     )
     fail_closed = recovery.rindex("return false;")
     assert active_branch < old_branch < new_branch < fail_closed
-    assert "removeBlocklistFile(BLOCKLIST_NEW_PATH)" in recovery[
-        active_branch:old_branch
-    ]
+    assert "cleanupOrphanedBlocklistUpload()" in recovery[active_branch:old_branch]
     assert "LittleFS.rename(BLOCKLIST_OLD_PATH, BLOCKLIST_PATH)" in recovery[
         old_branch:new_branch
     ]
@@ -684,26 +682,26 @@ def test_promotion_validates_before_touching_active_and_checks_rollback() -> Non
 
 
 def test_upload_keeps_p5_2_authorization_before_candidate_open() -> None:
-    upload = cpp_function(read_main(), "handleUpload")
+    source = read_main()
+    envelope = cpp_function(source, "handleFixedEnvelopeUpload")
+    upload = cpp_function(source, "handleUpload")
     start = upload.split("case UPLOAD_FILE_START:", 1)[1].split(
         "case UPLOAD_FILE_WRITE:", 1
     )[0]
 
-    authorize = start.index("requireAdminMutation(false)")
-    transaction = start.index("blocklistTransactionActive", authorize)
-    content_length = start.index("web.clientContentLength()", transaction)
-    request_limit = start.index("BLOCKLIST_UPLOAD_REQUEST_MAX", content_length)
+    authorize = envelope.index("requireAdminMutation()")
+    proof = envelope.index("reader.readExact(uploadProof, sizeof(uploadProof))", authorize)
+    signed_length = envelope.index("expectedPayloadLength != reader.remaining", proof)
+    start_upload = envelope.index("handleUpload(start)", signed_length)
+    transaction = start.index("blocklistTransactionActive")
     candidate = start.index("BLOCKLIST_NEW_PATH", transaction)
-    assert authorize < transaction < content_length < request_limit < candidate
-    assert "BlocklistUploadStatus::TOO_LARGE" in start[content_length:candidate]
+    assert authorize < proof < signed_length < start_upload
+    assert transaction < candidate
     assert "BLOCKLIST_PATH" not in start
     assert re.search(
-        r"BLOCKLIST_MULTIPART_OVERHEAD_MAX\s*=\s*4096\s*;", read_main()
-    )
-    assert re.search(
         r"BLOCKLIST_UPLOAD_REQUEST_MAX\s*=\s*"
-        r"BLOCKLIST_MAX_BYTES\s*\+\s*BLOCKLIST_MULTIPART_OVERHEAD_MAX\s*;",
-        read_main(),
+        r"BLOCKLIST_PROOF_BYTES\s*\+\s*BLOCKLIST_MAX_BYTES\s*;",
+        source,
     )
 
 
@@ -739,7 +737,7 @@ def test_upload_completion_reports_too_large_and_resets_concurrency_flag() -> No
     assert "blocklistTransactionActive = false" in done
     assert "promoteBlocklistCandidate" not in upload
     second_authorization = done.index("requireAdminMutation()")
-    promotion = done.index("promoteBlocklistCandidate()", second_authorization)
+    promotion = done.index("promoteBlocklistCandidate(uploadDeadlineReached)", second_authorization)
     assert second_authorization < promotion
     assert "validateBlocklistFile" in source
 
@@ -749,25 +747,21 @@ def test_upload_rechecks_authorization_before_promotion_and_discards_on_failure(
 
     final_authorization = done.index("requireAdminMutation()")
     authorization_failure = done.index("failBlocklistUpload", final_authorization)
-    promotion = done.index("promoteBlocklistCandidate()")
+    promotion = done.index("promoteBlocklistCandidate(uploadDeadlineReached)")
     assert final_authorization < authorization_failure < promotion
     assert "BlocklistUploadStatus::ABORTED" in done[
         final_authorization:promotion
     ]
 
 
-def test_multipart_total_size_mismatch_is_rejected_before_validation() -> None:
-    upload = cpp_function(read_main(), "handleUpload")
-    end = upload.split("case UPLOAD_FILE_END:", 1)[1].split(
-        "case UPLOAD_FILE_ABORTED:", 1
-    )[0]
+def test_signed_envelope_length_mismatch_is_rejected_before_staging() -> None:
+    envelope = cpp_function(read_main(), "handleFixedEnvelopeUpload")
 
-    mismatch = end.index("u.totalSize != uploadBytesWritten")
-    validation = end.index("validateBlocklistFile", mismatch)
-    assert mismatch < validation
-    assert "failBlocklistUpload(BlocklistUploadStatus::TOO_LARGE)" in end[
-        mismatch:validation
-    ]
+    proof = envelope.index("reader.readExact(uploadProof, sizeof(uploadProof))")
+    signed_length = envelope.index("expectedPayloadLength != reader.remaining", proof)
+    start = envelope.index("handleUpload(start)", signed_length)
+    assert proof < signed_length < start
+    assert "BlocklistUploadStatus::AUTH_INVALID" in envelope[signed_length:start]
 
 
 def test_second_upload_is_rejected_while_transaction_is_active() -> None:
@@ -782,7 +776,7 @@ def test_second_upload_is_rejected_while_transaction_is_active() -> None:
     assert "409" in read_main()
 
 
-def test_later_multipart_file_cannot_restart_a_completed_or_failed_part() -> None:
+def test_second_envelope_cannot_restart_a_completed_or_failed_transaction() -> None:
     upload = cpp_function(read_main(), "handleUpload")
     start = upload.split("case UPLOAD_FILE_START:", 1)[1].split(
         "case UPLOAD_FILE_WRITE:", 1
@@ -799,42 +793,34 @@ def test_later_multipart_file_cannot_restart_a_completed_or_failed_part() -> Non
     ]
 
 
-def test_parser_error_orphan_is_discarded_after_synchronous_handle_client() -> None:
+def test_failed_envelope_receive_aborts_the_real_candidate_path() -> None:
     source = read_main()
+    envelope = cpp_function(source, "handleFixedEnvelopeUpload")
+    upload = cpp_function(source, "handleUpload")
+
+    abort = envelope.index("HTTPUpload aborted")
+    complete = envelope.index("handleUploadDone()", abort)
+    assert abort < complete
+    aborted = upload.split("case UPLOAD_FILE_ABORTED:", 1)[1]
+    assert "removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)" in aborted
+    assert "LittleFS.remove(BLOCKLIST_NEW_PATH)" in aborted
+    assert "blocklistTransactionActive = false" in aborted
     cleanup = cpp_function(source, "cleanupOrphanedBlocklistUpload")
-    loop = cpp_function(source, "loop")
-
-    assert "blocklistTransactionActive" in cleanup
-    assert "discardBlocklistCandidate()" in cleanup
-    assert "blocklistTransactionActive = false" in cleanup
-    assert "uploadOwnsTransaction = false" in cleanup
-    handle_client = loop.index("web.handleClient()")
-    orphan_cleanup = loop.index("cleanupOrphanedBlocklistUpload()", handle_client)
-    dns = loop.index("handleDns()", orphan_cleanup)
-    assert handle_client < orphan_cleanup < dns
+    assert cleanup.index("BLOCKLIST_NEW_AUTH_PATH") < cleanup.index("BLOCKLIST_NEW_PATH")
 
 
-def test_non_multipart_upload_body_is_rejected_without_accessing_http_upload() -> None:
+def test_non_binary_upload_body_is_rejected_without_opening_staging() -> None:
     source = read_main()
-    unsupported = cpp_function(source, "handleUnsupportedUpload")
-    done = cpp_function(source, "handleUploadDone")
-    handler_start = source.index("class BlocklistUploadRequestHandler")
-    handler_end = source.index("\n};", handler_start)
-    handler = source[handler_start:handler_end]
+    handler = cpp_function(source, "handleFixedEnvelopeUpload")
 
-    assert "HTTPUpload& upload" in handler
-    assert "handleUpload(upload)" in handler
-    assert "HTTPRaw& raw" in handler
-    assert "handleUnsupportedUpload(raw)" in handler
-    assert "web.upload()" not in source
-    assert "web.raw()" not in source
-    assert "BLOCKLIST_NEW_PATH" not in unsupported
-    assert "LittleFS" not in unsupported
-    assert "BlocklistUploadStatus::UNSUPPORTED_MEDIA" in unsupported
-    assert 'status = 415; message = "multipart blocklist upload required"' in done
+    content_type = handler.index("requestHasOctetStreamContentType()")
+    candidate = handler.index("handleUpload(start)")
+    assert content_type < candidate
+    assert '"binary signed blocklist upload required"' in handler
+    assert "rejectRequestWithPendingBody" in handler
+    assert "multipart/form-data" not in source
     assert 'BLOCKLIST_UPLOAD_ROUTE = "/upload"' in source
-    assert "method == HTTP_POST && uri == BLOCKLIST_UPLOAD_ROUTE" in handler
-    assert "web.addHandler(new BlocklistUploadRequestHandler())" in source
+    assert "handleFixedEnvelopeUpload(request)" in source
 
 
 def test_littlefs_mount_and_recovery_fail_closed_before_normal_load() -> None:
@@ -856,8 +842,9 @@ def test_littlefs_mount_and_recovery_fail_closed_before_normal_load() -> None:
     )
     assert mount_guard is not None
     assert recovery_guard is not None
-    assert mount_guard.start() < setup.index("dnsServer.begin")
-    assert recovery_guard.start() < setup.index("dnsServer.begin")
+    dns_start = setup.index("startDnsServices()", active_load)
+    assert mount_guard.start() < dns_start
+    assert recovery_guard.start() < dns_start
 
 
 def test_runtime_blocklist_seek_and_read_failures_mark_storage_unhealthy() -> None:
@@ -881,13 +868,9 @@ def test_runtime_blocklist_failure_stops_network_instead_of_forwarding() -> None
     )
     upstream = dns.index("forwardUpstream(qlen)", read_guard)
     assert entry_guard < parse < lookup < read_guard < upstream
-    for stopped_service in (
-        "dnsServer.stop()",
-        "upstreamCli.stop()",
-        "web.stop()",
-        "MDNS.end()",
-    ):
+    for stopped_service in ("dnsServer.stop()", "upstreamCli.stop()"):
         assert stopped_service in fail_closed
+    assert "#include <WebServer" not in source
 
 
 def test_remote_blocklist_fetching_is_absent_from_production() -> None:
@@ -913,10 +896,10 @@ def test_remote_blocklist_fetching_is_absent_from_production() -> None:
     )
 
     assert not [token for token in forbidden if token in production]
-    routes = set(re.findall(r'web\.on\(\s*"([^"]+)"', source))
     assert 'BLOCKLIST_UPLOAD_ROUTE = "/upload"' in source
-    assert "web.addHandler(new BlocklistUploadRequestHandler())" in source
-    assert "/update" not in routes
+    assert "handleFixedEnvelopeUpload(request)" in source
+    assert "esp_http_server.h" in source
+    assert '"/update"' not in source
 
 
 def test_dashboard_keeps_only_manual_validated_blocklist_upload() -> None:
@@ -925,7 +908,8 @@ def test_dashboard_keeps_only_manual_validated_blocklist_upload() -> None:
 
     assert 'request("/upload",' in page
     assert "MAX_BLOCKLIST_BYTES=524285" in page
-    assert "new FormData()" in page
+    assert "new Blob([sf,f]" in page
+    assert "FormData" not in page
     assert "actualizaciones remotas de listas" in folded
     assert "desactivadas" in folded
     assert "blocklist validados" in folded

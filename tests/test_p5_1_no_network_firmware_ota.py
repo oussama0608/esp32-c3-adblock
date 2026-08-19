@@ -61,12 +61,11 @@ def test_firmware_source_has_no_network_firmware_ota(
 
 def test_http_firmware_update_route_is_absent_but_blocklist_routes_remain() -> None:
     source = source_text()
-    routes = set(re.findall(r'web\.on\(\s*"([^"]+)"', source))
-
-    assert "/update" not in routes
+    assert 'esp_http_server.h' in source
+    assert "/update" not in source
     assert 'BLOCKLIST_UPLOAD_ROUTE = "/upload"' in source
-    assert "web.addHandler(new BlocklistUploadRequestHandler())" in source
-    assert {"/fetchnow", "/setupdate"}.isdisjoint(routes)
+    assert "handleFixedEnvelopeUpload" in source
+    assert "/fetchnow" not in source and "/setupdate" not in source
 
 
 def test_dashboard_has_no_firmware_ota_controls() -> None:
@@ -147,7 +146,7 @@ def test_partitions_csv_is_byte_for_byte_p5_1_baseline() -> None:
     assert digest == PARTITIONS_CANONICAL_SHA256
 
 
-def test_c3_rf_workaround_is_minimal_and_has_two_call_sites() -> None:
+def test_c3_rf_workaround_is_minimal_and_has_bounded_call_sites() -> None:
     source = (REPO_ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
     helper = re.search(
         r"static bool applyC3RfWorkaround\(\)\s*\{\s*"
@@ -158,11 +157,11 @@ def test_c3_rf_workaround_is_minimal_and_has_two_call_sites() -> None:
     assert helper is not None
     calls = list(re.finditer(r"\bapplyC3RfWorkaround\(\)", source))
     call_sites = [match for match in calls if not helper.start() <= match.start() < helper.end()]
-    assert len(call_sites) == 2
+    assert len(call_sites) == 4  # normal STA, candidate STA, setup AP, admin AP.
     assert source.count("WiFi.setTxPower(") == 1
     assert source.count("WiFi.getTxPower(") == 0
     assert source.count("esp_wifi_get_max_tx_power(") == 0
-    assert source.count("WiFi.setSleep(false)") == 1
+    assert source.count("WiFi.setSleep(false)") == 2
 
     forbidden_rf_changes = (
         "esp_wifi_set_max_tx_power(",
@@ -177,7 +176,6 @@ def test_c3_rf_workaround_is_minimal_and_has_two_call_sites() -> None:
         "WiFi.setBandWidth(",
         "WiFi.setCountry(",
         "WiFi.setChannel(",
-        "WiFi.softAPConfig(",
         "pmf_cfg",
         "ampdu",
     )
@@ -207,7 +205,8 @@ def test_sta_rf_workaround_precedes_the_only_credential_bearing_begin() -> None:
         re.DOTALL,
     )
     power_guard = re.search(
-        r"if\s*\(\s*!applyC3RfWorkaround\(\)\s*\)\s*"
+        r"const\s+bool\s+staRfWorkaroundOk\s*=\s*applyC3RfWorkaround\(\);\s*"
+        r"(?:#if.*?#endif\s*)?if\s*\(\s*!staRfWorkaroundOk\s*\)\s*"
         r"\{.*?return false;\s*\}",
         connect,
         re.DOTALL,
@@ -215,30 +214,19 @@ def test_sta_rf_workaround_precedes_the_only_credential_bearing_begin() -> None:
     assert start_guard is not None
     assert power_guard is not None
     assert start_guard.end() < power_guard.start() < power_guard.end() < begin_index
-    assert source.count("WiFi.begin(") == 1
+    assert source.count("WiFi.begin(") == 2  # candidate validation is separate from normal boot.
     assert "esp_wifi_connect(" not in source
     assert connect.count("applyC3RfWorkaround()") == 1
 
 
-def test_ap_rf_workaround_follows_successful_normal_open_softap() -> None:
+def test_ap_rf_workaround_follows_successful_wpa2_softap() -> None:
     source = (REPO_ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
-    portal = source.split("static void startConfigPortal", 1)[1].split(
-        "void setup()", 1
+    portal = source.split("static bool startConfigPortal", 1)[1].split(
+        "static bool startAdminApWindow", 1
     )[0]
-    softap = re.search(
-        r"(?:const\s+)?bool\s+(?P<result>[A-Za-z_]\w*)\s*=\s*"
-        r"WiFi\.softAP\(ap\);",
-        portal,
-    )
-
-    assert softap is not None
-    assert '"C3-AdBlock-%02X%02X"' in portal
-    assert portal.index("WiFi.mode(WIFI_AP)") < softap.start()
-    guarded_helper = re.search(
-        rf"if\s*\(\s*{re.escape(softap.group('result'))}\s*&&\s*"
-        r"!applyC3RfWorkaround\(\)\s*\)",
-        portal[softap.end() :],
-    )
-    assert guarded_helper is not None
+    assert '"NetShield-Setup-%02X%02X"' in portal
+    softap = portal.index("WiFi.softAP(ap, psk.c_str(), 1, false, 1)")
+    assert portal.index("WiFi.mode(WIFI_AP)") < softap
+    assert "!softApOk || !applyC3RfWorkaround()" in portal
     assert portal.count("WiFi.softAP(") == 1
     assert portal.count("applyC3RfWorkaround()") == 1

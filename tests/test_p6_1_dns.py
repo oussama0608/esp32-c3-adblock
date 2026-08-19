@@ -354,11 +354,19 @@ def test_parse_and_block_decision_precede_any_upstream_send() -> None:
 
 
 def test_dns_socket_startup_failure_is_remembered_without_false_success() -> None:
-    setup = _function_from_signature(_main_source(), "void setup()")
+    source = _main_source()
+    setup = _function_from_signature(source, "void setup()")
+    startup = _static_function(source, "startDnsServices")
 
-    assert re.search(
-        r"upstreamSocketReady\s*=\s*upstreamCli\.begin\(0\)\s*!=\s*0\s*;",
-        setup,
+    assert "dnsServer.stop()" in startup
+    assert "dnsServer.begin(DNS_PORT) != 0" in startup
+    assert "admin_state::dnsStartupAction(dnsBound, retryUsed)" in startup
+    assert "networkServicesStarted = true" in startup
+    assert "networkServicesStarted = false" in startup
+    assert "upstreamSocketReady = upstreamCli.begin(0) != 0" in startup
+    assert "if (!startDnsServices())" in setup
+    assert setup.index("if (!startDnsServices())") < setup.index(
+        "runtimeState = RuntimeState::DNS_ONLY"
     )
 
 

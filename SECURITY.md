@@ -135,12 +135,18 @@ integridad de blocklist, TLS/SSRF, DNS o filesystem.
   confirmada y HIL de cortes. En P5.3a el upload aún no verificaba firma o
   procedencia; P5.5 añade ese gate de ingreso sin convertir las listas legacy en
   contenido autenticado en reposo.
-- El request multipart completo admite como filtro temprano 4.096 B sobre el
-  máximo del fichero; el límite streamed de 524.285 B sigue siendo definitivo.
-  Cuerpos raw/urlencoded se rechazan con 415 sin abrir un candidato.
-  El parser `WebServer` es síncrono: un framing excepcional puede producir un 413
-  conservador y siguen pendientes cliente lento, timeout, multipart malformado,
-  recuperación de transacción huérfana, disponibilidad DNS y rate limiting real.
+- En P6.2 el transporte de upload es exclusivamente `application/octet-stream`:
+  los bytes 0..127 son el `blocklist.sig` raw y el resto debe coincidir exactamente
+  con el `blocklist.bin` autenticado. El total máximo es 524.413 B; el payload
+  sigue limitado a 524.285 B. Cualquier otro media type o longitud se rechaza
+  antes de abrir staging. El reader es streaming y acotado. HIL real verificó que
+  `esp_http_server` rechaza antes del handler `Content-Length` duplicado (igual o
+  conflictivo), `Content-Length`+`Transfer-Encoding` y los dos órdenes de
+  `Transfer-Encoding` duplicado. Un `Transfer-Encoding: chunked` aislado sí llega
+  con `content_len=0`; por ello `/upload` rechaza explícitamente cualquier
+  `Transfer-Encoding` visible antes de consumir el slot, leer el envelope o abrir
+  staging. Siguen pendientes HIL de cliente lento, LittleFS/power-loss y
+  disponibilidad DNS.
 
 La validación local P5.3a termina con 163 tests y Ruff correctos. PlatformIO
 termina `SUCCESS` con 50.684 B de RAM, 1.122.703 B de flash enlazada y un
@@ -158,9 +164,10 @@ autoriza flash ni piloto.
   producción no existe en firmware, repositorio, tests ni CI.
 - La blocklist activa no cambia de formato. El proof separado tiene 128 bytes y
   firma con ECDSA P-256/SHA-256 el manifest que contiene secuencia no nula,
-  longitud, recuento y SHA-256 del payload. La UI exige ambos ficheros y transmite
-  el proof como 256 caracteres hexadecimales en `X-Blocklist-Proof`.
-- Host, sesión y CSRF se comprueban antes de validar el proof. Un header ausente,
+  longitud, recuento y SHA-256 del payload. La UI exige ambos ficheros y envía
+  un único cuerpo `application/octet-stream`: los 128 bytes raw de `blocklist.sig`
+  seguidos exactamente por `blocklist.bin`; no se acepta proof en cabeceras.
+- Host, sesión y CSRF se comprueban antes de leer el proof. Un prefijo ausente,
   malformado, no autorizado o con firma inválida se rechaza antes de abrir
   `/blocklist.new`. El candidato persistido se valida y autentica otra vez antes
   y después de la promoción; los fallos conservan o restauran el last-known-good.
@@ -176,7 +183,7 @@ autoriza flash ni piloto.
   construye el manifest exacto, exporta `r || s` fijo/low-S y escribe el proof
   atómicamente. No incorpora, solicita ni imprime la clave privada de producción.
 - Fetch remoto y firmware OTA permanecen ausentes. El panel sigue sobre HTTP
-  claro; CI real, HIL multipart, fallos de LittleFS y cortes en cada frontera
+  claro; CI real, HIL de framing/envelope, fallos de LittleFS y cortes en cada frontera
   siguen pendientes. Por ello P5.5 continúa **DEVELOPMENT-only** y PILOT es
   **NO-GO**.
 

@@ -7,11 +7,10 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <LittleFS.h>
-#include <ESPmDNS.h>
-#include <WebServer.h>
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include <esp_random.h>
+#include <esp_http_server.h>
 extern "C" {
 #include <mbedtls/constant_time.h>
 }
@@ -23,9 +22,13 @@ extern "C" {
 #include <mbedtls/platform_util.h>
 #include <mbedtls/sha256.h>
 #include "blocklist_trust.h"
+#include "admin_http_policy.h"
+#include "admin_state.h"
 #include "dns_protocol.h"
+#include "fixed_envelope.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_VERBOSE
 #error "Verbose Arduino core logging can expose WiFi/admin form values"
 #endif
@@ -44,7 +47,6 @@ static const char* BLOCKLIST_NEW_PATH = "/blocklist.new";
 static const char* BLOCKLIST_NEW_AUTH_PATH = "/blocklist.new.auth";
 static const char* BLOCKLIST_OLD_PATH = "/blocklist.old";
 static const char* BLOCKLIST_UPLOAD_ROUTE = "/upload";
-static const char* BLOCKLIST_PROOF_HEADER = "X-Blocklist-Proof";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 static const uint32_t BLOCKLIST_MAX_RECORDS = 104857;
@@ -53,12 +55,9 @@ static const size_t BLOCKLIST_MAX_BYTES = BLOCKLIST_MAX_RECORDS * HASH_BYTES;
 // Validate and keep those live, but never accept a new upload above the new cap.
 static const uint32_t BLOCKLIST_LEGACY_MAX_RECORDS = 250000;
 static const size_t BLOCKLIST_LEGACY_MAX_BYTES = BLOCKLIST_LEGACY_MAX_RECORDS * HASH_BYTES;
-// Multipart headers/boundaries are not part of the candidate file. This early
-// request gate rejects grossly oversized bodies; the exact file cap is enforced
-// independently for every streamed upload chunk.
-static const size_t BLOCKLIST_MULTIPART_OVERHEAD_MAX = 4096;
+static const size_t BLOCKLIST_PROOF_BYTES = kBlocklistProofSize;
 static const size_t BLOCKLIST_UPLOAD_REQUEST_MAX =
-  BLOCKLIST_MAX_BYTES + BLOCKLIST_MULTIPART_OVERHEAD_MAX;
+  BLOCKLIST_PROOF_BYTES + BLOCKLIST_MAX_BYTES;
 static const size_t ADMIN_PASSWORD_MIN_LENGTH = 12;
 static const size_t ADMIN_PASSWORD_MAX_LENGTH = 128;
 static const uint8_t ADMIN_VERIFIER_VERSION = 1;
@@ -77,6 +76,85 @@ static const uint32_t BOOT_RELEASE_STABLE_MS = 60;
 static const uint32_t WIFI_ASSOCIATION_TIMEOUT_MS = 20000;
 static const uint32_t WIFI_DISCONNECT_TIMEOUT_MS = 100;
 static const uint32_t WIFI_RETRY_SETTLE_MS = 250;
+static const size_t HTTP_MAX_URI_LEN = 512;
+static const size_t HTTP_MAX_HEADER_BYTES = 1024;
+static const size_t HTTP_FORM_MAX_BYTES = 2048;
+static const uint32_t HTTP_IO_TIMEOUT_SECONDS = 2;
+static const uint16_t HTTP_SERVER_MAX_OPEN_SOCKETS = 4;  // Three are internal; one client remains.
+
+enum HTTPUploadStatus { UPLOAD_FILE_START, UPLOAD_FILE_WRITE, UPLOAD_FILE_END, UPLOAD_FILE_ABORTED };
+struct HTTPUpload {
+  HTTPUploadStatus status;
+  size_t totalSize;
+  size_t currentSize;
+  uint8_t* buf;
+};
+
+// Small compatibility surface for the existing response/auth handlers.  It is
+// intentionally not an Arduino WebServer wrapper: every request is supplied by
+// esp_http_server and request bodies are parsed by the bounded helpers below.
+class BoundedHttpRequest {
+ public:
+  void begin(httpd_req_t* request) { request_ = request; argCount_ = 0; }
+  void end() { request_ = nullptr; argCount_ = 0; }
+  bool active() const { return request_ != nullptr; }
+  httpd_req_t* request() const { return request_; }
+  int clientContentLength() const { return request_ ? request_->content_len : -1; }
+  String header(const char* name) const {
+    if (!request_ || !name) return "";
+    const size_t length = httpd_req_get_hdr_value_len(request_, name);
+    if (length == 0 || length >= HTTP_MAX_HEADER_BYTES) return "";
+    static char value[HTTP_MAX_HEADER_BYTES];
+    if (httpd_req_get_hdr_value_str(request_, name, value, length + 1) != ESP_OK) return "";
+    return String(value);
+  }
+  String arg(const char* name) const {
+    for (size_t index = 0; index < argCount_; ++index) {
+      if (strcmp(args_[index].name, name) == 0) return String(args_[index].value);
+    }
+    return "";
+  }
+  bool addArg(const char* name, const char* value) {
+    if (!name || !value || argCount_ >= kMaxArgs || strlen(name) >= sizeof(args_[0].name) ||
+        strlen(value) >= sizeof(args_[0].value)) return false;
+    strlcpy(args_[argCount_].name, name, sizeof(args_[0].name));
+    strlcpy(args_[argCount_].value, value, sizeof(args_[0].value));
+    ++argCount_;
+    return true;
+  }
+  void sendHeader(const String& name, const String& value) const {
+    if (request_) httpd_resp_set_hdr(request_, name.c_str(), value.c_str());
+  }
+  void send(int status, const char* type, const String& body) const {
+    sendBytes(status, type, body.c_str(), body.length());
+  }
+  void send(int status, const char* type, const char* body) const {
+    sendBytes(status, type, body, body ? strlen(body) : 0);
+  }
+  void send_P(int status, const char* type, const char* body) const {
+    sendBytes(status, type, body, body ? strlen(body) : 0);
+  }
+
+ private:
+  struct Arg { char name[16]; char value[129]; };
+  static constexpr size_t kMaxArgs = 6;
+  httpd_req_t* request_ = nullptr;
+  Arg args_[kMaxArgs]{};
+  size_t argCount_ = 0;
+  void sendBytes(int status, const char* type, const char* body, size_t length) const {
+    if (!request_) return;
+    char statusText[20];
+    snprintf(statusText, sizeof(statusText), "%d %s", status,
+             status == 200 ? "OK" : status == 303 ? "See Other" : status == 400 ? "Bad Request" :
+             status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : status == 404 ? "Not Found" :
+             status == 409 ? "Conflict" : status == 413 ? "Payload Too Large" :
+             status == 415 ? "Unsupported Media Type" : status == 429 ? "Too Many Requests" :
+             status == 500 ? "Internal Server Error" : "Error");
+    httpd_resp_set_status(request_, statusText);
+    httpd_resp_set_type(request_, type);
+    httpd_resp_send(request_, body, length);
+  }
+};
 
 using dns_protocol::DNS_PACKET_MAX_BYTES;
 using dns_protocol::DNS_RESPONSE_CANDIDATE_MAX;
@@ -85,7 +163,10 @@ using dns_protocol::DNS_UPSTREAM_TIMEOUT_MS;
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
-WebServer web(80);
+BoundedHttpRequest web;
+httpd_handle_t adminHttpServer = nullptr;
+bool adminHttpAccepting = false;
+int adminHttpSocket = -1;
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
 uint8_t buf[DNS_PACKET_MAX_BYTES];
@@ -120,6 +201,15 @@ uint8_t  adminCsrfToken[CSRF_TOKEN_BYTES];
 uint32_t adminSessionStartedMs = 0;
 uint8_t  loginFailures = 0;
 uint32_t loginBlockedUntilMs = 0;
+bool adminWindowCloseRequested = false;
+using RuntimeState = admin_state::RuntimeState;
+RuntimeState runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED;
+admin_state::BootGestureTracker bootGesture;
+uint32_t adminWindowStartedMs = 0, provisioningStartedMs = 0, uploadStartedMs = 0;
+admin_state::WindowBudget uploadWindowBudget;
+bool uploadRequestInFlight = false;
+bool provisioningCandidatePending = false;
+String pendingProvisioningSsid, pendingProvisioningPassword, pendingProvisioningAdminPassword;
 
 struct BootHoldState {
   bool releaseObserved = false;
@@ -140,6 +230,8 @@ BootReleaseState runtimeRecoveryRelease;
 bool portalRestartPending = false;
 bool runtimeRecoveryPending = false;
 
+static void secureZero(void* data, size_t length);
+
 struct AdminVerifierRecord {
   uint8_t version;
   uint32_t iterations;
@@ -147,13 +239,71 @@ struct AdminVerifierRecord {
   uint8_t verifier[ADMIN_VERIFIER_BYTES];
 };
 
+// Versioned A/B configuration.  A complete valid record is selected by its
+// generation; legacy "wifi" + "admin" namespaces are read-only fallbacks.
+struct ConfigRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t generation;
+  uint8_t ssidLength;
+  uint8_t passwordLength;
+  char ssid[33];
+  char password[64];
+  AdminVerifierRecord admin;
+  uint32_t checksum;
+};
+static constexpr uint32_t CONFIG_MAGIC = 0x32474643;  // CFG2
+static constexpr uint16_t CONFIG_VERSION = 1;
+static const char* CONFIG_NAMESPACE = "cfgv2";
+static const char* CONFIG_SLOT_A = "a";
+static const char* CONFIG_SLOT_B = "b";
+
+static uint32_t configChecksum(const ConfigRecord& record) {
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < offsetof(ConfigRecord, checksum); ++i) {
+    hash ^= bytes[i]; hash *= 16777619UL;
+  }
+  return hash;
+}
+
+static bool validConfigRecord(const ConfigRecord& record) {
+  return record.magic == CONFIG_MAGIC && record.version == CONFIG_VERSION &&
+         record.ssidLength > 0 && record.ssidLength <= 32 && record.passwordLength <= 63 &&
+         record.ssid[record.ssidLength] == '\0' && record.password[record.passwordLength] == '\0' &&
+         record.admin.version == ADMIN_VERIFIER_VERSION && record.admin.iterations == ADMIN_PBKDF2_ITERATIONS &&
+         record.checksum == configChecksum(record);
+}
+
+static bool readConfigSlot(const char* key, ConfigRecord& record) {
+  secureZero(&record, sizeof(record));
+  Preferences config;
+  if (!config.begin(CONFIG_NAMESPACE, true)) return false;
+  const bool read = config.getBytesLength(key) == sizeof(record) &&
+                    config.getBytes(key, &record, sizeof(record)) == sizeof(record);
+  config.end();
+  if (!read || !validConfigRecord(record)) { secureZero(&record, sizeof(record)); return false; }
+  return true;
+}
+
+static bool loadActiveConfig(ConfigRecord& record) {
+  ConfigRecord a, b;
+  const bool validA = readConfigSlot(CONFIG_SLOT_A, a);
+  const bool validB = readConfigSlot(CONFIG_SLOT_B, b);
+  if (!validA && !validB) return false;
+  const bool selectA = validA && (!validB || static_cast<int16_t>(a.generation - b.generation) >= 0);
+  record = selectA ? a : b;
+  secureZero(&a, sizeof(a)); secureZero(&b, sizeof(b));
+  return true;
+}
+
 // ESP32-C3 SuperMini HIL showed unstable Wi-Fi association at default TX power.
 // Limit TX power to 8.5 dBm for stable AP/STA operation.
 static bool applyC3RfWorkaround() {
   return WiFi.setTxPower(WIFI_POWER_8_5dBm);
 }
 
-static bool waitForWiFiAssociation() {
+static bool waitForWiFiAssociation(const char* window) {
   const uint32_t startedAtMs = millis();
   while (WiFi.status() != WL_CONNECTED &&
          millis() - startedAtMs < WIFI_ASSOCIATION_TIMEOUT_MS) {
@@ -161,7 +311,8 @@ static bool waitForWiFiAssociation() {
     Serial.print(".");
   }
   Serial.println();
-  return WiFi.status() == WL_CONNECTED;
+  const wl_status_t finalStatus = WiFi.status();
+  return finalStatus == WL_CONNECTED;
 }
 
 static bool bootHoldReached(BootHoldState& state, uint32_t thresholdMs) {
@@ -231,6 +382,12 @@ static void clearAdminVerifier() {
 
 static bool loadAdminVerifier(AdminVerifierRecord& record) {
   secureZero(&record, sizeof(record));
+  ConfigRecord configRecord;
+  if (loadActiveConfig(configRecord)) {
+    record = configRecord.admin;
+    secureZero(&configRecord, sizeof(configRecord));
+    return true;
+  }
   Preferences adminPrefs;
   if (!adminPrefs.begin(ADMIN_NAMESPACE, true)) return false;
   record.version = adminPrefs.getUChar("version", 0);
@@ -279,6 +436,38 @@ static bool createAdminVerifier(const String& password) {
   }
   secureZero(&record, sizeof(record));
   if (!stored) clearAdminVerifier();
+  return stored;
+}
+
+static bool commitProvisioningCandidate(const String& ssid, const String& password,
+                                        const String& adminPassword) {
+  if (!ssid.length() || ssid.length() > 32 || password.length() > 63 ||
+      !validAdminPasswordLength(adminPassword)) return false;
+  ConfigRecord current, next;
+  const bool haveCurrent = loadActiveConfig(current);
+  secureZero(&next, sizeof(next));
+  next.magic = CONFIG_MAGIC; next.version = CONFIG_VERSION;
+  next.generation = haveCurrent ? static_cast<uint16_t>(current.generation + 1) : 1;
+  next.ssidLength = static_cast<uint8_t>(ssid.length());
+  next.passwordLength = static_cast<uint8_t>(password.length());
+  memcpy(next.ssid, ssid.c_str(), next.ssidLength); next.ssid[next.ssidLength] = '\0';
+  memcpy(next.password, password.c_str(), next.passwordLength); next.password[next.passwordLength] = '\0';
+  next.admin.version = ADMIN_VERIFIER_VERSION;
+  next.admin.iterations = ADMIN_PBKDF2_ITERATIONS;
+  esp_fill_random(next.admin.salt, sizeof(next.admin.salt));
+  if (!deriveAdminVerifier(adminPassword, next.admin.salt, next.admin.iterations, next.admin.verifier)) {
+    secureZero(&current, sizeof(current)); secureZero(&next, sizeof(next)); return false;
+  }
+  next.checksum = configChecksum(next);
+  const char* inactive = haveCurrent && (current.generation & 1U) ? CONFIG_SLOT_B : CONFIG_SLOT_A;
+  Preferences config;
+  bool stored = config.begin(CONFIG_NAMESPACE, false) &&
+                config.putBytes(inactive, &next, sizeof(next)) == sizeof(next);
+  ConfigRecord readback;
+  if (stored) stored = config.getBytes(inactive, &readback, sizeof(readback)) == sizeof(readback) &&
+                       memcmp(&readback, &next, sizeof(next)) == 0 && validConfigRecord(readback);
+  config.end();
+  secureZero(&readback, sizeof(readback)); secureZero(&current, sizeof(current)); secureZero(&next, sizeof(next));
   return stored;
 }
 
@@ -395,7 +584,8 @@ static bool requestHasValidCsrf() {
 }
 
 static bool isAllowedAdminHost(const String& rawHost, const String& localIp) {
-  if (!rawHost.length() || !localIp.length() || localIp == "0.0.0.0") return false;
+  if (runtimeState != RuntimeState::ADMIN_AP_WINDOW || !rawHost.length() ||
+      !localIp.length() || localIp == "0.0.0.0") return false;
   String host = rawHost;
   for (size_t i = 0; i < host.length(); i++) {
     const uint8_t ch = static_cast<uint8_t>(host[i]);
@@ -406,7 +596,7 @@ static bool isAllowedAdminHost(const String& rawHost, const String& localIp) {
   if (!host.length() || host.indexOf(':') >= 0) return false;
   String allowedIp = localIp;
   allowedIp.toLowerCase();
-  return host == allowedIp || host == "c3adblock.local";
+  return host == allowedIp;
 }
 
 static void addSecurityHeaders() {
@@ -420,7 +610,7 @@ static void addSecurityHeaders() {
 }
 
 static int adminAuthorizationStatus(bool requireCsrf) {
-  if (!isAllowedAdminHost(web.header("Host"), WiFi.localIP().toString())) return 403;
+  if (!isAllowedAdminHost(web.header("Host"), WiFi.softAPIP().toString())) return 403;
   if (!requestHasAdminSession()) return 401;
   if (requireCsrf && !requestHasValidCsrf()) return 403;
   return 200;
@@ -782,7 +972,7 @@ static String jsonEscape(const String& input) {
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 
 static bool requireAllowedAdminHost() {
-  if (isAllowedAdminHost(web.header("Host"), WiFi.localIP().toString())) return true;
+  if (isAllowedAdminHost(web.header("Host"), WiFi.softAPIP().toString())) return true;
   sendAuthorizationError(403);
   return false;
 }
@@ -818,6 +1008,7 @@ static void handleLoginPost() {
   clearSensitiveString(password);
   if (!verified) {
     recordLoginFailure();
+    if (loginFailures >= 10) adminWindowCloseRequested = true;
     sendLoginPage(401, true);
     return;
   }
@@ -848,6 +1039,7 @@ static void handleLogout() {
   addSecurityHeaders();
   web.sendHeader("Set-Cookie", "NSSESSION=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
   web.send(200, "text/plain", "signed out");
+  adminWindowCloseRequested = true;
 }
 
 static void handleDashboardRoot() {
@@ -867,7 +1059,7 @@ static void handleStats() {
   uint32_t up = millis() / 1000;
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String csrf = encodeHex(adminCsrfToken, sizeof(adminCsrfToken));
-  String j = "{\"csrf\":\"" + csrf + "\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
+  String j = "{\"csrf\":\"" + csrf + "\",\"ip\":\"" + WiFi.softAPIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
              ",\"clients\":[";
@@ -1032,23 +1224,6 @@ static uint64_t readLittleEndian64(const uint8_t* input) {
     value |= static_cast<uint64_t>(input[index]) << (8 * index);
   }
   return value;
-}
-
-static BlocklistProofStatus decodeBlocklistProofHex(
-    const String& encoded, uint8_t proof[kBlocklistProofSize]) {
-  secureZero(proof, kBlocklistProofSize);
-  if (!encoded.length()) return BlocklistProofStatus::MISSING;
-  if (encoded.length() != kBlocklistProofHexSize) return BlocklistProofStatus::BAD_SIZE;
-  for (size_t index = 0; index < kBlocklistProofSize; index++) {
-    const int high = hexValue(encoded[index * 2]);
-    const int low = hexValue(encoded[index * 2 + 1]);
-    if (high < 0 || low < 0) {
-      secureZero(proof, kBlocklistProofSize);
-      return BlocklistProofStatus::BAD_ENCODING;
-    }
-    proof[index] = static_cast<uint8_t>((high << 4) | low);
-  }
-  return BlocklistProofStatus::VALID;
 }
 
 static BlocklistProofStatus validateBlocklistProofEnvelope(
@@ -1263,6 +1438,14 @@ static bool removeBlocklistCandidateFiles() {
   return removeBlocklistFile(BLOCKLIST_NEW_PATH);
 }
 
+// Called only by boot recovery after the active/rollback state has been
+// classified.  Never removes the active list; proof-first preserves the
+// interrupted-promotion marker until it has been resolved.
+static bool cleanupOrphanedBlocklistUpload() {
+  if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) return false;
+  return removeBlocklistFile(BLOCKLIST_NEW_PATH);
+}
+
 static bool reopenBlocklist() {
   if (blocklist) blocklist.close();
   numHashes = 0;
@@ -1315,14 +1498,13 @@ static bool recoverBlocklistFiles() {
       return validateBlocklistFile(BLOCKLIST_PATH, false) ==
              BlocklistValidationStatus::VALID;
     }
-    if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) return false;
-    if (!removeBlocklistFile(BLOCKLIST_NEW_PATH)) return false;
+    if (!cleanupOrphanedBlocklistUpload()) return false;
     return removeBlocklistFile(BLOCKLIST_OLD_PATH);
   }
 
   if (oldStatus == BlocklistValidationStatus::VALID) {
     if (!removeBlocklistFile(BLOCKLIST_PATH)) return false;
-    if (!removeBlocklistCandidateFiles()) return false;
+    if (!cleanupOrphanedBlocklistUpload()) return false;
     if (!LittleFS.rename(BLOCKLIST_OLD_PATH, BLOCKLIST_PATH)) return false;
     if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
         BlocklistValidationStatus::VALID) {
@@ -1360,8 +1542,6 @@ static bool recoverBlocklistFiles() {
   if (networkServicesStarted) {
     dnsServer.stop();
     upstreamCli.stop();
-    web.stop();
-    MDNS.end();
     networkServicesStarted = false;
   }
   Serial.printf("[fs] %s\n", reason);
@@ -1383,16 +1563,30 @@ static bool restoreOldBlocklist() {
   return reopenBlocklist();
 }
 
-static bool promoteBlocklistCandidate() {
+static bool uploadDeadlineReached();
+
+static bool promoteBlocklistCandidate(bool (*deadlineExpired)()) {
+  if (!deadlineExpired || deadlineExpired()) return false;
   uint32_t candidateRecords = 0;
   if (authenticateBlocklistWithStoredProof(BLOCKLIST_NEW_PATH,
                                             &candidateRecords) !=
       BlocklistProofStatus::VALID) return false;
+  if (deadlineExpired()) return false;
   if (validateBlocklistFile(BLOCKLIST_PATH, false) !=
       BlocklistValidationStatus::VALID) {
     enterStorageFailClosed("active blocklist validation failed");
   }
+  if (admin_http_policy::promotionDeadlineAction(
+          admin_http_policy::PromotionPhase::BEFORE_ACTIVE_TO_OLD,
+          deadlineExpired()) != admin_http_policy::PromotionDeadlineAction::CONTINUE) {
+    return false;
+  }
   if (!removeBlocklistFile(BLOCKLIST_OLD_PATH)) return false;
+  if (admin_http_policy::promotionDeadlineAction(
+          admin_http_policy::PromotionPhase::BEFORE_ACTIVE_TO_OLD,
+          deadlineExpired()) != admin_http_policy::PromotionDeadlineAction::CONTINUE) {
+    return false;
+  }
 
   if (blocklist) blocklist.close();
   numHashes = 0;
@@ -1402,9 +1596,21 @@ static bool promoteBlocklistCandidate() {
     }
     return false;
   }
+  if (admin_http_policy::promotionDeadlineAction(
+          admin_http_policy::PromotionPhase::AFTER_ACTIVE_TO_OLD,
+          deadlineExpired()) != admin_http_policy::PromotionDeadlineAction::CONTINUE) {
+    if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist deadline rollback failed");
+    return false;
+  }
   if (!LittleFS.rename(BLOCKLIST_NEW_PATH, BLOCKLIST_PATH)) {
     const bool restored = restoreOldBlocklist();
     if (!restored) enterStorageFailClosed("blocklist rollback failed");
+    return false;
+  }
+  if (admin_http_policy::promotionDeadlineAction(
+          admin_http_policy::PromotionPhase::AFTER_NEW_TO_ACTIVE,
+          deadlineExpired()) != admin_http_policy::PromotionDeadlineAction::CONTINUE) {
+    if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist deadline rollback failed");
     return false;
   }
   uint32_t promotedRecords = 0;
@@ -1417,15 +1623,28 @@ static bool promoteBlocklistCandidate() {
     }
     return false;
   }
+  if (deadlineExpired()) {
+    if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist deadline rollback failed");
+    return false;
+  }
   if (!removeBlocklistFile(BLOCKLIST_NEW_AUTH_PATH)) {
     if (!restoreOldBlocklist()) {
       enterStorageFailClosed("blocklist rollback failed");
     }
     return false;
   }
+  if (deadlineExpired()) {
+    if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist deadline rollback failed");
+    return false;
+  }
   if (!LittleFS.remove(BLOCKLIST_OLD_PATH)) {
     if (!restoreOldBlocklist()) enterStorageFailClosed("blocklist rollback failed");
     return false;
+  }
+  if (admin_http_policy::promotionDeadlineAction(
+          admin_http_policy::PromotionPhase::AFTER_CLEANUP,
+          deadlineExpired()) == admin_http_policy::PromotionDeadlineAction::FAIL_CLOSED) {
+    enterStorageFailClosed("blocklist deadline after promotion cleanup");
   }
   return true;
 }
@@ -1444,7 +1663,6 @@ enum class BlocklistUploadStatus : uint8_t {
   AUTH_INVALID,
   CRYPTO_ERROR,
   ABORTED,
-  UNSUPPORTED_MEDIA,
   PROMOTION_ERROR,
 };
 
@@ -1455,6 +1673,7 @@ static size_t uploadBytesWritten = 0;
 static BlocklistUploadStatus blocklistUploadStatus = BlocklistUploadStatus::IDLE;
 static File upFile;
 static uint8_t uploadProof[kBlocklistProofSize];
+static bool uploadProofEnvelopeValid = false;
 
 static bool discardBlocklistCandidate() {
   if (upFile) upFile.close();
@@ -1481,9 +1700,16 @@ static bool writeBlocklistCandidateProof() {
 
 static void resetBlocklistUploadRequestState() {
   uploadAuthorized = false;
+  uploadRequestInFlight = false;
   uploadBytesWritten = 0;
   blocklistUploadStatus = BlocklistUploadStatus::IDLE;
+  uploadProofEnvelopeValid = false;
   secureZero(uploadProof, sizeof(uploadProof));
+}
+
+static bool uploadDeadlineReached() {
+  return uploadRequestInFlight &&
+         admin_state::uploadDeadlineReached(millis(), adminWindowStartedMs, uploadStartedMs);
 }
 
 static void failBlocklistUpload(BlocklistUploadStatus status) {
@@ -1497,28 +1723,45 @@ static void failBlocklistUpload(BlocklistUploadStatus status) {
   uploadOwnsTransaction = false;
 }
 
-static void handleUploadDone() {
+static bool handleUploadDone() {
+  if (uploadDeadlineReached()) {
+    if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::ABORTED);
+    addSecurityHeaders();
+    web.send(400, "text/plain", "blocklist upload deadline exceeded");
+    resetBlocklistUploadRequestState();
+    return false;
+  }
   if (!requireAdminMutation()) {
     if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::ABORTED);
     resetBlocklistUploadRequestState();
-    return;
+    return false;
   }
   if (!uploadAuthorized) {
     if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::ABORTED);
     addSecurityHeaders();
     web.send(400, "text/plain", "incomplete blocklist upload");
     resetBlocklistUploadRequestState();
-    return;
+    return false;
   }
 
   if (blocklistUploadStatus == BlocklistUploadStatus::CANDIDATE_READY) {
-    blocklistUploadStatus = promoteBlocklistCandidate()
-      ? BlocklistUploadStatus::SUCCESS
-      : BlocklistUploadStatus::PROMOTION_ERROR;
+    if (uploadDeadlineReached()) {
+      failBlocklistUpload(BlocklistUploadStatus::ABORTED);
+    } else {
+      blocklistUploadStatus = promoteBlocklistCandidate(uploadDeadlineReached)
+        ? BlocklistUploadStatus::SUCCESS
+        : BlocklistUploadStatus::PROMOTION_ERROR;
+    }
     if (blocklistUploadStatus != BlocklistUploadStatus::SUCCESS &&
         !discardBlocklistCandidate()) {
       blocklistUploadStatus = BlocklistUploadStatus::STORAGE_ERROR;
     }
+  }
+  if (blocklistUploadStatus == BlocklistUploadStatus::SUCCESS && uploadDeadlineReached()) {
+    // Cleanup has already made the new list active.  Do not falsely report a
+    // transaction that crossed its absolute deadline; preserve safety by
+    // entering the existing storage fail-closed state.
+    enterStorageFailClosed("blocklist deadline before success response");
   }
   if (uploadOwnsTransaction) {
     blocklistTransactionActive = false;
@@ -1544,8 +1787,6 @@ static void handleUploadDone() {
       status = 500; message = "blocklist verification unavailable"; break;
     case BlocklistUploadStatus::ABORTED:
       status = 400; message = "blocklist upload aborted"; break;
-    case BlocklistUploadStatus::UNSUPPORTED_MEDIA:
-      status = 415; message = "multipart blocklist upload required"; break;
     case BlocklistUploadStatus::STORAGE_ERROR:
     case BlocklistUploadStatus::WRITE_ERROR:
       status = 507; message = "blocklist storage failure"; break;
@@ -1559,20 +1800,26 @@ static void handleUploadDone() {
   Serial.printf("[blocklist] upload result=%d bytes=%u records=%u\n",
                 status, static_cast<unsigned>(uploadBytesWritten), numHashes);
   addSecurityHeaders();
+  const bool success = blocklistUploadStatus == BlocklistUploadStatus::SUCCESS;
+  if (success && uploadDeadlineReached()) {
+    enterStorageFailClosed("blocklist deadline before success response");
+  }
+  if (success) (void)uploadWindowBudget.recordPromotion(true);
   web.send(status, "text/plain", message);
   resetBlocklistUploadRequestState();
+  return success;
 }
 
 static void handleUpload(HTTPUpload& u) {
   switch (u.status) {
     case UPLOAD_FILE_START: {
-      uploadAuthorized = requireAdminMutation(false);
-      if (!uploadAuthorized) {
+      if (!uploadAuthorized || !uploadProofEnvelopeValid) {
+        if (uploadAuthorized) blocklistUploadStatus = BlocklistUploadStatus::PROOF_REQUIRED;
         if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::ABORTED);
         break;
       }
-      // One multipart request may contain more than one file part. Preserve the
-      // first terminal result and never let a later part restart the request.
+      // Preserve the first terminal result and never let another request part
+      // restart the transaction after the fixed envelope has been validated.
       if (blocklistUploadStatus != BlocklistUploadStatus::IDLE) {
         if (uploadOwnsTransaction) failBlocklistUpload(BlocklistUploadStatus::BUSY);
         break;
@@ -1582,25 +1829,6 @@ static void handleUpload(HTTPUpload& u) {
           failBlocklistUpload(BlocklistUploadStatus::BUSY);
         } else {
           blocklistUploadStatus = BlocklistUploadStatus::BUSY;
-        }
-        break;
-      }
-      String encodedProof = web.header(BLOCKLIST_PROOF_HEADER);
-      BlocklistProofStatus proofStatus =
-        decodeBlocklistProofHex(encodedProof, uploadProof);
-      clearSensitiveString(encodedProof);
-      if (proofStatus == BlocklistProofStatus::VALID) {
-        proofStatus = validateBlocklistProofEnvelope(uploadProof);
-      }
-      if (proofStatus != BlocklistProofStatus::VALID) {
-        Serial.printf("[blocklist] upload proof rejected=%s\n",
-                      blocklistProofToken(proofStatus));
-        if (proofStatus == BlocklistProofStatus::MISSING) {
-          blocklistUploadStatus = BlocklistUploadStatus::PROOF_REQUIRED;
-        } else if (proofStatus == BlocklistProofStatus::CRYPTO_ERROR) {
-          blocklistUploadStatus = BlocklistUploadStatus::CRYPTO_ERROR;
-        } else {
-          blocklistUploadStatus = BlocklistUploadStatus::AUTH_INVALID;
         }
         break;
       }
@@ -1645,11 +1873,19 @@ static void handleUpload(HTTPUpload& u) {
     case UPLOAD_FILE_END: {
       if (!uploadAuthorized) break;
       if (blocklistUploadStatus != BlocklistUploadStatus::RECEIVING || !upFile) break;
+      if (uploadDeadlineReached()) {
+        failBlocklistUpload(BlocklistUploadStatus::ABORTED);
+        break;
+      }
       upFile.flush();
       upFile.close();
       if (uploadBytesWritten > BLOCKLIST_MAX_BYTES ||
           u.totalSize != uploadBytesWritten) {
         failBlocklistUpload(BlocklistUploadStatus::TOO_LARGE);
+        break;
+      }
+      if (uploadDeadlineReached()) {
+        failBlocklistUpload(BlocklistUploadStatus::ABORTED);
         break;
       }
       const BlocklistValidationStatus validation =
@@ -1660,8 +1896,16 @@ static void handleUpload(HTTPUpload& u) {
         failBlocklistUpload(BlocklistUploadStatus::INVALID);
         break;
       }
+      if (uploadDeadlineReached()) {
+        failBlocklistUpload(BlocklistUploadStatus::ABORTED);
+        break;
+      }
       if (!writeBlocklistCandidateProof()) {
         failBlocklistUpload(BlocklistUploadStatus::STORAGE_ERROR);
+        break;
+      }
+      if (uploadDeadlineReached()) {
+        failBlocklistUpload(BlocklistUploadStatus::ABORTED);
         break;
       }
       const BlocklistProofStatus proofStatus =
@@ -1676,6 +1920,10 @@ static void handleUpload(HTTPUpload& u) {
                  ? BlocklistUploadStatus::STORAGE_ERROR
                  : BlocklistUploadStatus::AUTH_INVALID);
         failBlocklistUpload(failureStatus);
+        break;
+      }
+      if (uploadDeadlineReached()) {
+        failBlocklistUpload(BlocklistUploadStatus::ABORTED);
         break;
       }
       blocklistUploadStatus = BlocklistUploadStatus::CANDIDATE_READY;
@@ -1702,69 +1950,224 @@ static void handleUpload(HTTPUpload& u) {
   }
 }
 
-static void handleUnsupportedUpload(HTTPRaw& raw) {
-  if (raw.status != RAW_START) return;
-  uploadAuthorized = requireAdminMutation(false);
-  if (!uploadAuthorized) return;
-  if (blocklistTransactionActive && uploadOwnsTransaction) {
-    failBlocklistUpload(BlocklistUploadStatus::BUSY);
-  } else {
-    blocklistUploadStatus = BlocklistUploadStatus::UNSUPPORTED_MEDIA;
+static bool requestStateAllowsAdmin();
+static bool headerEqualsPrefix(const String& value, const char* prefix);
+static esp_err_t sendBadRequest(httpd_req_t* request, int status, const char* message);
+
+static fixed_envelope::ReceiveResult receiveEnvelopeBytes(
+    void* context, char* buffer, size_t length) {
+  const int received = httpd_req_recv(static_cast<httpd_req_t*>(context), buffer, length);
+  if (received > 0) {
+    return {fixed_envelope::ReceiveStatus::OK, static_cast<size_t>(received)};
   }
+  if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+    return {fixed_envelope::ReceiveStatus::TIMEOUT, 0};
+  }
+  if (received == 0) {
+    return {fixed_envelope::ReceiveStatus::END_OF_BODY, 0};
+  }
+  return {fixed_envelope::ReceiveStatus::ERROR, 0};
 }
 
-class BlocklistUploadRequestHandler final : public RequestHandler {
- public:
-  bool canHandle(WebServer& server, HTTPMethod method, const String& uri) override {
-    (void)server;
-    return method == HTTP_POST && uri == BLOCKLIST_UPLOAD_ROUTE;
+static uint32_t envelopeMillis() { return millis(); }
+
+static bool receiveFailureRequiresClose(fixed_envelope::ReceiveStatus status) {
+  return status != fixed_envelope::ReceiveStatus::OK;
+}
+
+static bool flushUploadBytes(uint8_t* bytes, size_t& count) {
+  if (!count) return true;
+  HTTPUpload upload{UPLOAD_FILE_WRITE, 0, count, bytes};
+  handleUpload(upload);
+  count = 0;
+  return blocklistUploadStatus == BlocklistUploadStatus::RECEIVING;
+}
+
+static bool parseStrictContentLength(const String& value, size_t maximum,
+                                     size_t* parsedLength) {
+  return admin_http_policy::parseStrictDecimal(value.c_str(), value.length(),
+                                                maximum, parsedLength);
+}
+
+static esp_err_t rejectRequestWithPendingBody(httpd_req_t* request, int status,
+                                              const char* message,
+                                              admin_http_policy::RequestBodyFraming framing) {
+  const esp_err_t response = sendBadRequest(request, status, message);
+  return admin_http_policy::mustCloseRequestBody(framing) ? ESP_FAIL : response;
+}
+
+static bool requestHasOctetStreamContentType() {
+  String contentType = web.header("Content-Type");
+  contentType.trim();
+  contentType.toLowerCase();
+  const bool matches = contentType == "application/octet-stream";
+  clearSensitiveString(contentType);
+  return matches;
+}
+
+static bool requestHasTransferEncoding() {
+  String transferEncoding = web.header("Transfer-Encoding");
+  const bool present = transferEncoding.length() != 0;
+  clearSensitiveString(transferEncoding);
+  return present;
+}
+
+static BlocklistUploadStatus blocklistProofFailureStatus(BlocklistProofStatus status) {
+  if (status == BlocklistProofStatus::MISSING) return BlocklistUploadStatus::PROOF_REQUIRED;
+  if (status == BlocklistProofStatus::CRYPTO_ERROR) return BlocklistUploadStatus::CRYPTO_ERROR;
+  return BlocklistUploadStatus::AUTH_INVALID;
+}
+
+static bool streamAuthenticatedBlocklistPayload(
+    fixed_envelope::Reader& reader, size_t expectedLength,
+    fixed_envelope::ReceiveStatus* receiveStatus) {
+  if (!receiveStatus) return false;
+  *receiveStatus = fixed_envelope::ReceiveStatus::OK;
+  uint8_t output[256];
+  while (expectedLength) {
+    const size_t chunkLength = min(expectedLength, sizeof(output));
+    const fixed_envelope::ReceiveStatus status = reader.readExact(output, chunkLength);
+    if (status != fixed_envelope::ReceiveStatus::OK) {
+      *receiveStatus = status;
+      return false;
+    }
+    size_t pending = chunkLength;
+    if (!flushUploadBytes(output, pending)) return false;
+    expectedLength -= chunkLength;
+  }
+  return reader.remaining() == 0;
+}
+
+static esp_err_t handleFixedEnvelopeUpload(httpd_req_t* request) {
+  if (!requestStateAllowsAdmin()) return ESP_FAIL;
+  String declaredLength = web.header("Content-Length");
+  size_t declared = 0;
+  const bool validDeclaredLength = parseStrictContentLength(
+      declaredLength, BLOCKLIST_UPLOAD_REQUEST_MAX, &declared);
+  clearSensitiveString(declaredLength);
+  const bool hasTransferEncoding = requestHasTransferEncoding();
+  const bool trustedFraming = !hasTransferEncoding && validDeclaredLength &&
+      request->content_len != 0 && declared == request->content_len &&
+      declared > BLOCKLIST_PROOF_BYTES && declared <= BLOCKLIST_UPLOAD_REQUEST_MAX;
+  if (!trustedFraming) {
+    return rejectRequestWithPendingBody(request, 400, "invalid binary upload length",
+                                        {false, request->content_len});
   }
 
-  bool canUpload(WebServer& server, const String& uri) override {
-    return server.method() == HTTP_POST && uri == BLOCKLIST_UPLOAD_ROUTE;
+  if (!requestHasOctetStreamContentType()) {
+    return rejectRequestWithPendingBody(request, 415,
+                                        "binary signed blocklist upload required",
+                                        {true, request->content_len});
   }
 
-  bool canRaw(WebServer& server, const String& uri) override {
-    return server.method() == HTTP_POST && uri == BLOCKLIST_UPLOAD_ROUTE;
+  if (!admin_state::acceptsNewAdminWork(millis(), adminWindowStartedMs) ||
+      !uploadWindowBudget.allowUploadStart() || uploadRequestInFlight) {
+    return rejectRequestWithPendingBody(request, 403, "upload window closed",
+                                        {true, request->content_len});
   }
 
-  bool handle(WebServer& server, HTTPMethod method, const String& uri) override {
-    if (!canHandle(server, method, uri)) return false;
+  if (!requireAdminMutation()) return ESP_FAIL;
+  uploadAuthorized = true;
+  if (blocklistTransactionActive) {
+    blocklistUploadStatus = BlocklistUploadStatus::BUSY;
     handleUploadDone();
-    return true;
+    return ESP_FAIL;
+  }
+  if (!uploadWindowBudget.recordUploadStart()) {
+    return rejectRequestWithPendingBody(request, 403, "upload window closed",
+                                        {true, request->content_len});
+  }
+  uploadStartedMs = millis();
+  uploadRequestInFlight = true;
+  fixed_envelope::Reader reader(
+      request->content_len, uploadStartedMs,
+      admin_state::uploadDeadlineDuration(adminWindowStartedMs, uploadStartedMs),
+      request, receiveEnvelopeBytes, envelopeMillis);
+  const fixed_envelope::ReceiveStatus proofRead =
+      reader.readExact(uploadProof, sizeof(uploadProof));
+  if (proofRead != fixed_envelope::ReceiveStatus::OK) {
+    blocklistUploadStatus = BlocklistUploadStatus::ABORTED;
+    handleUploadDone();
+    return receiveFailureRequiresClose(proofRead) ? ESP_FAIL : ESP_OK;
+  }
+  const BlocklistProofStatus proofStatus = validateBlocklistProofEnvelope(uploadProof);
+  if (proofStatus != BlocklistProofStatus::VALID) {
+    blocklistUploadStatus = blocklistProofFailureStatus(proofStatus);
+    handleUploadDone();
+    return admin_http_policy::mustCloseRequestBody({true, reader.remaining()})
+      ? ESP_FAIL : ESP_OK;
+  }
+  const size_t expectedPayloadLength =
+    static_cast<size_t>(readLittleEndian32(uploadProof + kBlocklistPayloadSizeOffset));
+  if (!fixed_envelope::hasAllowedPayloadLength(
+          request->content_len, BLOCKLIST_PROOF_BYTES,
+          expectedPayloadLength, BLOCKLIST_MAX_BYTES) ||
+      expectedPayloadLength != reader.remaining()) {
+    blocklistUploadStatus = BlocklistUploadStatus::AUTH_INVALID;
+    handleUploadDone();
+    return admin_http_policy::mustCloseRequestBody({true, reader.remaining()})
+      ? ESP_FAIL : ESP_OK;
+  }
+  if (uploadDeadlineReached()) {
+    blocklistUploadStatus = BlocklistUploadStatus::ABORTED;
+    handleUploadDone();
+    return ESP_FAIL;
+  }
+  uploadProofEnvelopeValid = true;
+
+  HTTPUpload start{UPLOAD_FILE_START, 0, 0, nullptr};
+  handleUpload(start);
+  if (!uploadAuthorized || blocklistUploadStatus != BlocklistUploadStatus::RECEIVING) {
+    handleUploadDone();
+    return admin_http_policy::mustCloseRequestBody({true, reader.remaining()})
+      ? ESP_FAIL : ESP_OK;
   }
 
-  void upload(WebServer& server, const String& uri, HTTPUpload& upload) override {
-    (void)server;
-    (void)uri;
-    handleUpload(upload);
+  fixed_envelope::ReceiveStatus payloadReceiveStatus = fixed_envelope::ReceiveStatus::OK;
+  const bool payloadComplete = streamAuthenticatedBlocklistPayload(
+      reader, expectedPayloadLength, &payloadReceiveStatus) && !uploadDeadlineReached();
+  if (!payloadComplete && payloadReceiveStatus == fixed_envelope::ReceiveStatus::OK &&
+      uploadDeadlineReached()) {
+    payloadReceiveStatus = fixed_envelope::ReceiveStatus::DEADLINE;
   }
-
-  void raw(WebServer& server, const String& uri, HTTPRaw& raw) override {
-    (void)server;
-    (void)uri;
-    handleUnsupportedUpload(raw);
+  if (!payloadComplete) {
+    HTTPUpload aborted{UPLOAD_FILE_ABORTED, 0, 0, nullptr};
+    handleUpload(aborted);
+  } else {
+    HTTPUpload end{UPLOAD_FILE_END, uploadBytesWritten, 0, nullptr};
+    handleUpload(end);
   }
-};
-
-static void cleanupOrphanedBlocklistUpload() {
-  // In the pinned synchronous WebServer, a multipart request is parsed entirely
-  // inside handleClient(). A live transaction here means parsing returned on an
-  // error path without UPLOAD_FILE_ABORTED or the final route handler.
-  if (!blocklistTransactionActive &&
-      blocklistUploadStatus == BlocklistUploadStatus::IDLE) return;
-  const bool cleaned = discardBlocklistCandidate();
-  blocklistTransactionActive = false;
-  uploadOwnsTransaction = false;
-  resetBlocklistUploadRequestState();
-  Serial.printf("[blocklist] orphaned upload discarded=%s; active retained\n",
-                cleaned ? "true" : "false");
+  const bool promotionSucceeded = handleUploadDone();
+  return receiveFailureRequiresClose(payloadReceiveStatus) ||
+         admin_http_policy::mustCloseRequestBody({true, reader.remaining()}) ? ESP_FAIL : ESP_OK;
 }
 
 // ---------- WiFi provisioning (captive portal) ----------
 // Try provisioned NVS creds first, then the compile-time secrets.h creds as a
 // fallback (so the maintainer's own device + source builders keep working). If
 // neither connects, fall through to the config portal.
+static const char* ADMIN_AP_NAMESPACE = "adminap";
+static const char* ADMIN_AP_PSK_KEY = "psk";
+
+static bool validAdminApPsk(const String& psk) {
+  if (psk.length() < 8 || psk.length() > 63) return false;
+  for (size_t index = 0; index < psk.length(); ++index) {
+    const uint8_t ch = static_cast<uint8_t>(psk[index]);
+    if (ch < 0x20 || ch > 0x7e) return false;
+  }
+  return true;
+}
+
+// Manufacturing/USB tooling owns this value.  The generic firmware never
+// creates, derives, prints, or substitutes an AP password.
+static bool loadAdminApPsk(String& psk) {
+  Preferences apPrefs;
+  if (!apPrefs.begin(ADMIN_AP_NAMESPACE, true)) return false;
+  psk = apPrefs.getString(ADMIN_AP_PSK_KEY, "");
+  apPrefs.end();
+  return validAdminApPsk(psk);
+}
+
 static void clearWifiCredentials() {
   if (prefs.begin("wifi", false)) {
     prefs.clear();
@@ -1776,6 +2179,9 @@ static void refreshProvisioningCsrf() {
   secureZero(provisioningCsrf, sizeof(provisioningCsrf));
   esp_fill_random(provisioningCsrf, sizeof(provisioningCsrf));
 }
+
+static bool startBoundedHttpServer(bool provisioning);
+static void closeAdminWindowAndRestart(const char* reason);
 
 static void handlePortalBootAuthorization() {
   if (physicalProvisioningAllowed ||
@@ -1829,10 +2235,17 @@ static bool validProvisioningCsrf() {
 }
 
 static bool connectWiFi() {
-  prefs.begin("wifi", true);
-  String ss = prefs.getString("ssid", "");
-  String pw = prefs.getString("pass", "");
-  prefs.end();
+  ConfigRecord config;
+  String ss, pw;
+  if (loadActiveConfig(config)) {
+    ss = String(config.ssid); pw = String(config.password);
+    secureZero(&config, sizeof(config));
+  } else {
+    prefs.begin("wifi", true);
+    ss = prefs.getString("ssid", "");
+    pw = prefs.getString("pass", "");
+    prefs.end();
+  }
   const char* ssid = ss.length() ? ss.c_str() : WIFI_SSID;
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) {
@@ -1849,14 +2262,15 @@ static bool connectWiFi() {
     clearSensitiveString(pw);
     return false;
   }
-  if (!applyC3RfWorkaround()) {
+  const bool staRfWorkaroundOk = applyC3RfWorkaround();
+  if (!staRfWorkaroundOk) {
     Serial.println("[wifi] failed to apply the 8.5 dBm STA TX power limit");
     clearSensitiveString(pw);
     return false;
   }
   WiFi.begin(ssid, pass);
   clearSensitiveString(pw);
-  if (waitForWiFiAssociation()) return true;
+  if (waitForWiFiAssociation("first")) return true;
 
   Serial.println("[wifi] first association window timed out; retrying once");
   const bool disconnectedForRetry =
@@ -1868,11 +2282,12 @@ static bool connectWiFi() {
   }
   delay(WIFI_RETRY_SETTLE_MS);
 
-  if (!WiFi.reconnect()) {
+  const bool reconnectRequested = WiFi.reconnect();
+  if (!reconnectRequested) {
     Serial.println("[wifi] reconnect request failed");
     return false;
   }
-  if (waitForWiFiAssociation()) return true;
+  if (waitForWiFiAssociation("second")) return true;
 
   const bool finalDisconnectOk =
     WiFi.disconnect(false, false, WIFI_DISCONNECT_TIMEOUT_MS);
@@ -1883,6 +2298,29 @@ static bool connectWiFi() {
   return false;
 }
 
+static bool startDnsServices() {
+  bool retryUsed = false;
+  while (true) {
+    dnsServer.stop();
+    const bool dnsBound = dnsServer.begin(DNS_PORT) != 0;
+    const admin_state::DnsStartupAction action =
+      admin_state::dnsStartupAction(dnsBound, retryUsed);
+    if (action == admin_state::DnsStartupAction::STARTED) {
+      upstreamCli.stop();
+      upstreamSocketReady = upstreamCli.begin(0) != 0;
+      networkServicesStarted = true;
+      return true;
+    }
+    if (action == admin_state::DnsStartupAction::FAIL_CLOSED) {
+      upstreamCli.stop();
+      upstreamSocketReady = false;
+      networkServicesStarted = false;
+      return false;
+    }
+    retryUsed = true;
+  }
+}
+
 static void handlePortalRoot() {
   String html =
     "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -1890,7 +2328,7 @@ static void handlePortalRoot() {
     "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
     "<h2>&#128737; NetShield Mini &mdash; configuraci&oacute;n Wi-Fi</h2>";
   if (!physicalProvisioningAllowed) {
-    html += "<p>Los cambios requieren autorizaci&oacute;n f&iacute;sica. Con el dispositivo ya encendido, mant&eacute;n pulsado BOOT durante 3 segundos, su&eacute;ltalo y recarga esta p&aacute;gina. No reinicies ni apagues el dispositivo mientras pulsas BOOT.</p>";
+    html += "<p>Los cambios requieren autorizaci&oacute;n f&iacute;sica. Con el dispositivo ya encendido, mant&eacute;n pulsado BOOT durante 5 segundos, su&eacute;ltalo y recarga esta p&aacute;gina. No reinicies ni apagues el dispositivo mientras pulsas BOOT.</p>";
   } else {
     String csrf = encodeHex(provisioningCsrf, sizeof(provisioningCsrf));
     html +=
@@ -1937,79 +2375,129 @@ static void handleWifiSave() {
     return;
   }
 
-  if (!createAdminVerifier(adminPassword)) {
-    clearSensitiveString(pw);
-    clearSensitiveString(adminPassword);
-    clearSensitiveString(adminConfirmation);
-    addSecurityHeaders();
-    web.send(500, "text/plain", "could not save setup");
-    return;
-  }
-
-  bool wifiStored = prefs.begin("wifi", false);
-  if (wifiStored) {
-    const size_t ssidBytes = prefs.putString("ssid", ss);
-    const size_t passwordBytes = prefs.putString("pass", pw);
-    wifiStored = ssidBytes == ss.length() &&
-                 (pw.length() == 0 || passwordBytes == pw.length());
-    prefs.end();
-  }
-  clearSensitiveString(pw);
-  clearSensitiveString(adminPassword);
+  // No candidate byte reaches NVS here.  The provisioning supervisor first
+  // proves STA association, then writes one complete inactive A/B record.
+  pendingProvisioningSsid = ss;
+  pendingProvisioningPassword = pw;
+  pendingProvisioningAdminPassword = adminPassword;
+  provisioningCandidatePending = true;
   clearSensitiveString(adminConfirmation);
-  if (!wifiStored) {
-    clearAdminVerifier();
-    addSecurityHeaders();
-    web.send(500, "text/plain", "could not save setup");
-    return;
-  }
-
   physicalProvisioningAllowed = false;
   secureZero(provisioningCsrf, sizeof(provisioningCsrf));
-  portalRestartPending = true;
   String escapedSsid = htmlEscape(ss);
   addSecurityHeaders();
   web.send(200, "text/html; charset=utf-8", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
-                             "&#9989; Guardado. Suelta BOOT si sigue pulsado; el dispositivo reiniciar&aacute; para conectar con <b>" + escapedSsid + "</b>&hellip;<br><br>"
-                             "Vuelve a conectar el dispositivo cliente a tu Wi-Fi habitual y abre <b>c3adblock.local</b>.</body>");
+                             "&#9989; Probando la red indicada antes de guardarla: <b>" + escapedSsid + "</b>&hellip;</body>");
 }
 // Never returns — blocks in the portal loop until creds are saved (then reboots).
-static void startConfigPortal() {
-  int n = WiFi.scanNetworks();                 // scan while still in STA mode (no APSTA)
-  portalOpts = "";
-  for (int i = 0; i < n && i < 15; i++) {
-    portalOpts += "<option value=\"" + htmlEscape(WiFi.SSID(i)) + "\"></option>";
+static bool startConfigPortal(bool authorized) {
+  // Setup HTTP is a recovery-only mutation surface.  A normal boot, an
+  // ordinary STA failure, and a 2–<4 second admin gesture must not publish it.
+  if (!authorized) {
+    runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED;
+    return false;
   }
+  String psk;
+  if (!loadAdminApPsk(psk)) {
+    runtimeState = RuntimeState::ADMIN_PSK_REQUIRED;
+    Serial.println("[setup] per-device admin AP PSK missing; USB/manufacturing recovery required");
+    return false;
+  }
+  portalOpts = "";  // Do not scan or disclose nearby SSIDs in this window.
   uint8_t mac[6]; WiFi.macAddress(mac);
-  char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
+  char ap[28]; snprintf(ap, sizeof(ap), "NetShield-Setup-%02X%02X", mac[4], mac[5]);
   const bool apModeOk = WiFi.mode(WIFI_AP);
-  if (!apModeOk) {
-    Serial.println("[setup] ERROR: configuration portal AP mode failed; configuration remains locked");
-    while (true) delay(1000);
-  }
-  const bool softApOk = WiFi.softAP(ap);
-  if (!softApOk) {
-    Serial.println("[setup] ERROR: configuration portal AP failed to start; configuration remains locked");
-    while (true) delay(1000);
-  }
-  if (softApOk && !applyC3RfWorkaround()) {
-    Serial.println("[wifi] failed to apply the 8.5 dBm AP TX power limit");
+  const bool apConfigOk = apModeOk && WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  const bool softApOk = apConfigOk && WiFi.softAP(ap, psk.c_str(), 1, false, 1);
+  clearSensitiveString(psk);
+  if (!softApOk || !applyC3RfWorkaround() || !startBoundedHttpServer(true)) {
+    runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED;
+    Serial.println("[setup] bounded WPA2 setup AP failed");
+    return false;
   }
   refreshProvisioningCsrf();
-  IPAddress apIP = WiFi.softAPIP();
-  dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
-  web.on("/", HTTP_GET, handlePortalRoot);
-  web.on("/wifisave", HTTP_POST, handleWifiSave);
-  web.onNotFound(handlePortalRoot);            // any captive-portal probe -> the form
-  web.begin();
-  Serial.printf("\n[setup] Configuration portal ready. Join open network \"%s\" and open http://%s\n",
-                ap, apIP.toString().c_str());
-  while (true) {
-    dnsPortal.processNextRequest();
-    web.handleClient();
-    handlePortalBootAuthorization();
-    handlePortalRestart();
-    delay(2);
+  physicalProvisioningAllowed = true;
+  if (runtimeState != RuntimeState::PROVISIONING_AP) provisioningStartedMs = millis();
+  runtimeState = RuntimeState::PROVISIONING_AP;
+  dnsPortal.start(53, "*", WiFi.softAPIP());
+  Serial.printf("[setup] WPA2 setup AP ready: %s\n", ap);
+  return true;
+}
+
+static bool startAdminApWindow() {
+  String psk;
+  if (!loadAdminApPsk(psk)) {
+    runtimeState = RuntimeState::ADMIN_PSK_REQUIRED;
+    Serial.println("[admin] per-device AP PSK missing; no admin listener started");
+    return false;
+  }
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  char ap[28]; snprintf(ap, sizeof(ap), "NetShield-Admin-%02X%02X", mac[4], mac[5]);
+  const bool apModeOk = WiFi.mode(WIFI_AP);
+  bool apConfigOk = false;
+  if (apModeOk) {
+    apConfigOk = WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  }
+  bool softApOk = false;
+  if (apConfigOk) {
+    softApOk = WiFi.softAP(ap, psk.c_str(), 1, false, 1);
+  }
+  clearSensitiveString(psk);
+  bool rfOk = false;
+  if (softApOk) {
+    rfOk = applyC3RfWorkaround();
+  }
+  bool httpOk = false;
+  if (rfOk) {
+    httpOk = startBoundedHttpServer(false);
+  }
+  if (!softApOk || !rfOk || !httpOk) {
+    Serial.println("[admin] WPA2 admin AP failed; rebooting to DNS-only mode");
+    ESP.restart();
+    return false;
+  }
+  clearAdminSession(); resetLoginThrottle(); adminHttpSocket = -1;
+  adminWindowCloseRequested = false; uploadWindowBudget = admin_state::WindowBudget{};
+  adminWindowStartedMs = millis(); runtimeState = RuntimeState::ADMIN_AP_WINDOW;
+  Serial.printf("[admin] WPA2 admin window ready: %s\n", ap);
+  return true;
+}
+
+static bool validateProvisioningCandidateSta() {
+  adminHttpAccepting = false;
+  dnsPortal.stop();
+  if (adminHttpServer) { httpd_stop(adminHttpServer); adminHttpServer = nullptr; }
+  WiFi.softAPdisconnect(true);
+  const bool modeOk = WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  const uint32_t started = millis();
+  while (modeOk && !WiFi.STA.started() && millis() - started < 1000) delay(1);
+  if (!modeOk || !WiFi.STA.started() || !applyC3RfWorkaround()) return false;
+  WiFi.begin(pendingProvisioningSsid.c_str(), pendingProvisioningPassword.c_str());
+  if (waitForWiFiAssociation("candidate-first")) return true;
+  if (!WiFi.disconnect(false, false, WIFI_DISCONNECT_TIMEOUT_MS)) return false;
+  delay(WIFI_RETRY_SETTLE_MS);
+  if (!WiFi.reconnect()) return false;
+  if (waitForWiFiAssociation("candidate-second")) return true;
+  WiFi.disconnect(false, false, WIFI_DISCONNECT_TIMEOUT_MS);
+  delay(WIFI_RETRY_SETTLE_MS);
+  return false;
+}
+
+static void processProvisioningCandidate() {
+  if (!provisioningCandidatePending) return;
+  provisioningCandidatePending = false;
+  const bool connected = validateProvisioningCandidateSta();
+  const bool committed = connected && commitProvisioningCandidate(
+    pendingProvisioningSsid, pendingProvisioningPassword, pendingProvisioningAdminPassword);
+  clearSensitiveString(pendingProvisioningPassword);
+  clearSensitiveString(pendingProvisioningAdminPassword);
+  clearSensitiveString(pendingProvisioningSsid);
+  if (committed) { ESP.restart(); return; }
+  if (!admin_state::deadlineReached(millis(), provisioningStartedMs, admin_state::kProvisioningWindowMs)) {
+    startConfigPortal(true);
+  } else {
+    runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED;
   }
 }
 
@@ -2044,6 +2532,236 @@ static void handleNotFound() {
   web.send(404, "text/plain", "not found");
 }
 
+static bool headerEqualsPrefix(const String& value, const char* prefix) {
+  return value.startsWith(prefix);
+}
+
+static admin_http_policy::FormReadOutcome readRequiredForm(httpd_req_t* request) {
+  using admin_http_policy::FormReadOutcome;
+  using admin_http_policy::FormReadStatus;
+  if (!request) return {FormReadStatus::BAD_REQUEST, true};
+  const size_t requestLength = request->content_len;
+  const bool hasTransferEncoding = requestHasTransferEncoding();
+  if (hasTransferEncoding || !requestLength || requestLength > HTTP_FORM_MAX_BYTES) {
+    return admin_http_policy::formFramingOutcome(hasTransferEncoding, requestLength);
+  }
+  String declaredLength = web.header("Content-Length");
+  size_t declared = 0;
+  const bool validDeclaredLength = parseStrictContentLength(
+      declaredLength, HTTP_FORM_MAX_BYTES, &declared);
+  clearSensitiveString(declaredLength);
+  if (!validDeclaredLength || declared != requestLength) {
+    return {FormReadStatus::BAD_REQUEST, false};
+  }
+  String contentType = web.header("Content-Type");
+  const bool formType = headerEqualsPrefix(contentType, "application/x-www-form-urlencoded");
+  clearSensitiveString(contentType);
+  if (!formType) return {FormReadStatus::BAD_REQUEST, false};
+
+  static char body[HTTP_FORM_MAX_BYTES + 1];
+  auto finish = [](FormReadStatus status, bool bodyConsumed) {
+    secureZero(body, sizeof(body));
+    return FormReadOutcome{status, bodyConsumed};
+  };
+  size_t received = 0;
+  const uint32_t started = millis();
+  while (received < requestLength) {
+    if (admin_state::deadlineReached(millis(), started, HTTP_IO_TIMEOUT_SECONDS * 1000UL)) {
+      return finish(FormReadStatus::TIMEOUT, false);
+    }
+    const int result = httpd_req_recv(request, body + received,
+                                      requestLength - received);
+    const FormReadStatus receiveStatus = admin_http_policy::formReceiveStatus(
+        result, result == HTTPD_SOCK_ERR_TIMEOUT);
+    if (receiveStatus != FormReadStatus::OK) return finish(receiveStatus, false);
+    if (static_cast<size_t>(result) > requestLength - received) {
+      return finish(FormReadStatus::RECEIVE_ERROR, false);
+    }
+    received += static_cast<size_t>(result);
+  }
+  if (admin_state::deadlineReached(millis(), started, HTTP_IO_TIMEOUT_SECONDS * 1000UL)) {
+    return finish(FormReadStatus::TIMEOUT, true);
+  }
+  body[received] = '\0';
+  char* pair = body;
+  while (pair && *pair) {
+    char* next = strchr(pair, '&');
+    if (next) *next++ = '\0';
+    char* equals = strchr(pair, '=');
+    if (!equals) return finish(FormReadStatus::BAD_REQUEST, true);
+    *equals++ = '\0';
+    auto decode = [](char* text) -> bool {
+      char* out = text;
+      for (char* in = text; *in; ++in) {
+        if (*in == '+') { *out++ = ' '; continue; }
+        if (*in == '%') {
+          if (!in[1] || !in[2]) return false;
+          const int high = hexValue(in[1]);
+          const int low = hexValue(in[2]);
+          if (high < 0 || low < 0) return false;
+          *out++ = static_cast<char>((high << 4) | low);
+          in += 2;
+          continue;
+        }
+        *out++ = *in;
+      }
+      *out = '\0';
+      return true;
+    };
+    if (!decode(pair) || !decode(equals) || !web.addArg(pair, equals)) {
+      return finish(FormReadStatus::BAD_REQUEST, true);
+    }
+    pair = next;
+  }
+  return finish(FormReadStatus::OK, true);
+}
+
+static esp_err_t sendBadRequest(httpd_req_t* request, int status, const char* message) {
+  web.begin(request);
+  addSecurityHeaders();
+  web.send(status, "text/plain", message);
+  web.end();
+  return ESP_OK;
+}
+
+static bool requestStateAllowsAdmin() {
+  if (runtimeState != RuntimeState::ADMIN_AP_WINDOW || !adminHttpAccepting) return false;
+  if (admin_state::deadlineReached(millis(), adminWindowStartedMs,
+                                   admin_state::kAdminHardCeilingMs)) return false;
+  return uploadRequestInFlight || admin_state::acceptsNewAdminWork(
+      millis(), adminWindowStartedMs);
+}
+
+static bool requestStateAllowsProvisioning() {
+  return runtimeState == RuntimeState::PROVISIONING_AP && adminHttpAccepting;
+}
+
+static esp_err_t handleFixedEnvelopeUpload(httpd_req_t* request);
+
+static esp_err_t dispatchAdminGet(httpd_req_t* request) {
+  if (!requestStateAllowsAdmin()) return sendBadRequest(request, 403, "admin window closed");
+  web.begin(request); adminHttpSocket = httpd_req_to_sockfd(request);
+  if (strcmp(request->uri, "/") == 0) handleDashboardRoot();
+  else if (strcmp(request->uri, "/login") == 0) handleLoginGet();
+  else if (strcmp(request->uri, "/app.js") == 0) handleAppJs();
+  else if (strcmp(request->uri, "/stats.json") == 0) handleStats();
+  else handleNotFound();
+  web.end();
+  return ESP_OK;
+}
+
+static esp_err_t dispatchAdminPost(httpd_req_t* request) {
+  if (!requestStateAllowsAdmin()) {
+    return rejectRequestWithPendingBody(request, 403, "admin window closed",
+                                        {false, request->content_len});
+  }
+  web.begin(request); adminHttpSocket = httpd_req_to_sockfd(request);
+  if (strcmp(request->uri, BLOCKLIST_UPLOAD_ROUTE) == 0) {
+    const esp_err_t result = handleFixedEnvelopeUpload(request);
+    web.end();
+    return result;
+  }
+  if (strcmp(request->uri, "/login") != 0 && strcmp(request->uri, "/logout") != 0) {
+    web.end();
+    return rejectRequestWithPendingBody(request, 404, "not found",
+                                        {false, request->content_len});
+  }
+  if (strcmp(request->uri, "/login") == 0) {
+    const admin_http_policy::FormReadOutcome form = readRequiredForm(request);
+    if (form.status != admin_http_policy::FormReadStatus::OK) {
+      web.end();
+      const esp_err_t response = sendBadRequest(request, 400, "invalid request body");
+      return admin_http_policy::mustCloseConnection(form) ? ESP_FAIL : response;
+    }
+  } else if (requestHasTransferEncoding() || request->content_len != 0) {
+    web.end();
+    return rejectRequestWithPendingBody(request, 400, "logout request must be empty",
+                                        {false, request->content_len});
+  }
+  if (strcmp(request->uri, "/login") == 0) handleLoginPost(); else handleLogout();
+  web.end();
+  return ESP_OK;
+}
+
+static esp_err_t dispatchProvisioningGet(httpd_req_t* request) {
+  if (!requestStateAllowsProvisioning()) return sendBadRequest(request, 403, "setup window closed");
+  web.begin(request); adminHttpSocket = httpd_req_to_sockfd(request);
+  handlePortalRoot();
+  web.end();
+  return ESP_OK;
+}
+
+static esp_err_t dispatchProvisioningPost(httpd_req_t* request) {
+  if (!requestStateAllowsProvisioning()) {
+    return rejectRequestWithPendingBody(request, 403, "setup window closed",
+                                        {false, request->content_len});
+  }
+  web.begin(request); adminHttpSocket = httpd_req_to_sockfd(request);
+  if (strcmp(request->uri, "/wifisave") != 0) {
+    web.end();
+    return rejectRequestWithPendingBody(request, 404, "not found",
+                                        {false, request->content_len});
+  }
+  const admin_http_policy::FormReadOutcome form = readRequiredForm(request);
+  if (form.status != admin_http_policy::FormReadStatus::OK) {
+    web.end();
+    const esp_err_t response = sendBadRequest(request, 400, "invalid request body");
+    return admin_http_policy::mustCloseConnection(form) ? ESP_FAIL : response;
+  }
+  handleWifiSave();
+  web.end();
+  return ESP_OK;
+}
+
+static bool registerUri(const char* uri, httpd_method_t method, esp_err_t (*handler)(httpd_req_t*)) {
+  httpd_uri_t route{};
+  route.uri = uri;
+  route.method = method;
+  route.handler = handler;
+  return httpd_register_uri_handler(adminHttpServer, &route) == ESP_OK;
+}
+
+static bool startBoundedHttpServer(bool provisioning) {
+  if (adminHttpServer) return false;
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.max_uri_len = HTTP_MAX_URI_LEN;
+  config.max_req_hdr_len = HTTP_MAX_HEADER_BYTES;
+  config.max_open_sockets = HTTP_SERVER_MAX_OPEN_SOCKETS;
+  config.max_uri_handlers = 8;
+  config.recv_wait_timeout = HTTP_IO_TIMEOUT_SECONDS;
+  config.send_wait_timeout = HTTP_IO_TIMEOUT_SECONDS;
+  config.backlog_conn = 1;
+  config.uri_match_fn = httpd_uri_match_wildcard;
+  if (httpd_start(&adminHttpServer, &config) != ESP_OK) return false;
+  const bool registered = provisioning
+    ? registerUri("/*", HTTP_GET, dispatchProvisioningGet) &&
+      registerUri("/wifisave", HTTP_POST, dispatchProvisioningPost)
+    : registerUri("/", HTTP_GET, dispatchAdminGet) &&
+      registerUri("/login", HTTP_GET, dispatchAdminGet) &&
+      registerUri("/login", HTTP_POST, dispatchAdminPost) &&
+      registerUri("/logout", HTTP_POST, dispatchAdminPost) &&
+      registerUri("/app.js", HTTP_GET, dispatchAdminGet) &&
+      registerUri("/stats.json", HTTP_GET, dispatchAdminGet) &&
+      registerUri(BLOCKLIST_UPLOAD_ROUTE, HTTP_POST, dispatchAdminPost);
+  if (!registered) {
+    httpd_stop(adminHttpServer);
+    adminHttpServer = nullptr;
+    return false;
+  }
+  adminHttpAccepting = true;
+  return true;
+}
+
+static void closeAdminWindowAndRestart(const char* reason) {
+  adminHttpAccepting = false;
+  clearAdminSession();
+  if (adminHttpServer && adminHttpSocket >= 0) {
+    httpd_sess_trigger_close(adminHttpServer, adminHttpSocket);
+  }
+  Serial.printf("[admin] closing window: %s\n", reason);
+  ESP.restart();
+}
+
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
@@ -2051,11 +2769,6 @@ void setup() {
   // GPIO9 is a strapping pin. Recovery is armed only after the running firmware
   // observes BOOT released, then measures a new continuous hold at runtime.
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-
-  static const char* REQUEST_HEADERS[] = {
-    "Host", "Cookie", "X-CSRF-Token", BLOCKLIST_PROOF_HEADER
-  };
-  web.collectHeaders(REQUEST_HEADERS, sizeof(REQUEST_HEADERS) / sizeof(REQUEST_HEADERS[0]));
 
   if (!LittleFS.begin(false)) enterStorageFailClosed("LittleFS mount failed");
   if (!recoverBlocklistFiles()) enterStorageFailClosed("blocklist recovery failed");
@@ -2068,36 +2781,78 @@ void setup() {
   // the optional compile-time fallback remain the only credential sources.
   WiFi.persistent(false);
 
-  // An admin verifier must exist before provisioned or compile-time WiFi can
-  // bypass the physically authorized setup portal.
-  if (!hasAdminVerifier()) startConfigPortal();
-  if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
+  // A legacy complete Wi-Fi/admin pair remains boot-compatible without a
+  // migration write.  HTTP is deliberately absent in normal DNS-only mode.
+  if (!hasAdminVerifier()) {
+    runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED;
+    Serial.println("[setup] admin verifier missing; hold BOOT for 5 seconds then release for recovery");
+    return;
+  }
+  const bool setupWifiConnected = connectWiFi();
+  if (!setupWifiConnected) {
+    runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED;
+    Serial.println("[wifi] offline; hold BOOT for 5 seconds then release for recovery");
+    return;
+  }
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
-  dnsServer.begin(DNS_PORT);
-  upstreamSocketReady = upstreamCli.begin(0) != 0;
-  web.on("/login", HTTP_GET, handleLoginGet);
-  web.on("/login", HTTP_POST, handleLoginPost);
-  web.on("/logout", HTTP_POST, handleLogout);
-  web.on("/", HTTP_GET, handleDashboardRoot);
-  web.on("/app.js", HTTP_GET, handleAppJs);
-  web.on("/stats.json", HTTP_GET, handleStats);
-  web.on("/ban", HTTP_POST, handleBan);
-  web.on("/addblock", HTTP_POST, handleAddBlock);
-  web.on("/unblock", HTTP_POST, handleUnblock);
-  web.on("/forgetwifi", HTTP_POST, handleForgetWifi);
-  web.addHandler(new BlocklistUploadRequestHandler());  // validated blocklist data only
-  web.onNotFound(handleNotFound);
-  web.begin();
-  networkServicesStarted = true;
-  Serial.println("DNS :53 + dashboard :80 up");
+  if (!startDnsServices()) {
+    runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED;
+    Serial.println("[dns] UDP/53 bind failed; hold BOOT for 5 seconds then release for recovery");
+    return;
+  }
+  runtimeState = RuntimeState::DNS_ONLY;
+  Serial.println("DNS :53 up; HTTP administration requires physical BOOT authorization");
 }
 
 void loop() {
-  web.handleClient();
-  cleanupOrphanedBlocklistUpload();
-  bool busy = handleDns();
-  handleRuntimeBootRecovery();
-  if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
+  const uint32_t now = millis();
+  const bool bootPressed = digitalRead(BOOT_BUTTON_PIN) == LOW;
+  const admin_state::BootGesture gesture = bootGesture.update(bootPressed, now);
+  const admin_state::BootAction bootAction = admin_state::bootActionFor(runtimeState, gesture);
+
+  if (runtimeState == RuntimeState::DNS_ONLY) {
+    if (bootAction == admin_state::BootAction::OPEN_ADMIN) {
+      dnsServer.stop();
+      upstreamCli.stop();
+      networkServicesStarted = false;
+      startAdminApWindow();
+      return;
+    }
+    if (bootAction == admin_state::BootAction::OPEN_PROVISIONING) {
+      dnsServer.stop(); upstreamCli.stop(); networkServicesStarted = false;
+      startConfigPortal(true);  // old known-good configuration remains intact.
+      return;
+    }
+    const bool busy = handleDns();
+    if (!busy) delay(1);
+    return;
+  }
+
+  if (runtimeState == RuntimeState::OFFLINE_RECOVERY_REQUIRED || runtimeState == RuntimeState::ADMIN_PSK_REQUIRED) {
+    if (bootAction == admin_state::BootAction::OPEN_PROVISIONING) startConfigPortal(true);
+    delay(2);
+    return;
+  }
+
+  if (runtimeState == RuntimeState::ADMIN_AP_WINDOW) {
+    if (adminWindowCloseRequested || admin_state::mustCloseAdminWindow(
+        now, adminWindowStartedMs, uploadRequestInFlight)) {
+      closeAdminWindowAndRestart("deadline/logout/login budget");
+    }
+    delay(2);
+    return;
+  }
+
+  if (runtimeState == RuntimeState::PROVISIONING_AP) {
+    dnsPortal.processNextRequest();
+    if (admin_state::deadlineReached(now, provisioningStartedMs, admin_state::kProvisioningWindowMs)) {
+      closeAdminWindowAndRestart("provisioning deadline");
+    }
+    if (provisioningCandidatePending) {
+      processProvisioningCandidate();
+      return;
+    }
+    delay(2);
+  }
 }

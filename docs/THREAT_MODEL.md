@@ -282,12 +282,20 @@ mientras old todavía permite rollback y old se elimina al final. En recuperaci�
 un candidato sin proof nunca gana y el estado active+proof sin candidate se trata
 como marcador de promoción interrumpida.
 
-Esto reduce la posibilidad de que una sesión administrativa comprometida instale
-una política arbitraria, pero no elimina el riesgo del canal HTTP ni el DoS de
-upload. Las listas active/old legacy unsigned continúan siendo boot-compatibles,
+En P6.2 el transporte es un único cuerpo `application/octet-stream`: los bytes
+0..127 son el proof raw y el resto es exactamente el payload firmado. Esto evita
+confiar en cabeceras de proof duplicables, sin cambiar `blocklist.sig` ni
+`blocklist.bin`. Reduce la posibilidad de que una sesión administrativa
+comprometida instale una política arbitraria, pero no elimina el riesgo del canal
+HTTP ni el DoS de upload. Las listas active/old legacy unsigned continúan siendo boot-compatibles,
 V1 permite replay de releases correctamente firmadas y no conserva attestation
 del active en reposo. TM-06 y TM-13 siguen como máximo candidatas a `MITIGATED`
-hasta CI, multipart real y HIL de cortes; no pasan a `CLOSED`.
+ hasta CI, HIL de envelope/cortes y validación del resto de la matriz; no pasan a
+ `CLOSED`. El HIL de framing crudo sí confirmó el rechazo pre-handler de
+ `Content-Length` duplicado, `Content-Length`+`Transfer-Encoding` y los órdenes
+ probados de `Transfer-Encoding` duplicado. `Transfer-Encoding: chunked` aislado
+ llega con longitud cero, por lo que `/upload` lo rechaza explícitamente antes
+ del envelope y staging.
 
 Validación local P5.5: 231 tests, Ruff, `ci_checks repository`, diff checks y
 archivos protegidos correctos. PlatformIO `SUCCESS`: 50.828 B RAM,

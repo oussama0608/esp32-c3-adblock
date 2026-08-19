@@ -627,40 +627,40 @@ def test_private_key_material_is_absent_from_repository_candidates() -> None:
     ]
 
 
-def test_ui_requires_bin_and_128_byte_sig_and_sends_hex_header() -> None:
+def test_ui_requires_bin_and_128_byte_sig_and_sends_fixed_binary_envelope() -> None:
     page = PAGE_PATH.read_text(encoding="utf-8")
 
     assert 'id="blf" accept=".bin"' in page
     assert 'id="sigf" accept=".sig"' in page
     assert "BLOCKLIST_PROOF_BYTES=128" in page
     assert "sf.size!==BLOCKLIST_PROOF_BYTES" in page
-    assert "new Uint8Array(await sf.arrayBuffer())" in page
-    assert 'padStart(2,"0")' in page
-    assert 'options.headers["X-Blocklist-Proof"]=proofHex' in page
-    upload = page.split('request("/upload",', 1)[1].split("if(!r.ok)", 1)[0]
-    assert "withBlocklistProof(" in upload
-    assert "headers:csrfHeaders()" in upload
-    assert 'fd.append("f",f)' in page
-    assert "fd.append(\"f\",sf)" not in page
+    assert "f.size<1" in page
+    assert "new Blob([sf,f],{type:\"application/octet-stream\"})" in page
+    assert 'headers["Content-Type"]="application/octet-stream"' in page
+    assert "FormData" not in page
+    assert "X-Blocklist-Proof" not in page
     assert "innerHTML" not in page
 
 
 def test_upload_authenticates_proof_before_candidate_creation() -> None:
     source = read_main()
+    envelope = cpp_function(source, "handleFixedEnvelopeUpload")
     upload = cpp_function(source, "handleUpload")
     start = upload.split("case UPLOAD_FILE_START:", 1)[1].split(
         "case UPLOAD_FILE_WRITE:", 1
     )[0]
 
-    authorize = start.index("requireAdminMutation(false)")
-    header = start.index("web.header(BLOCKLIST_PROOF_HEADER)", authorize)
-    decode = start.index("decodeBlocklistProofHex", header)
-    verify = start.index("validateBlocklistProofEnvelope", decode)
-    discard = start.index("removeBlocklistCandidateFiles", verify)
+    authorize = envelope.index("requireAdminMutation()")
+    proof = envelope.index("reader.readExact(uploadProof, sizeof(uploadProof))", authorize)
+    verify = envelope.index("validateBlocklistProofEnvelope", proof)
+    signed_length = envelope.index("expectedPayloadLength != reader.remaining", verify)
+    start_upload = envelope.index("handleUpload(start)", signed_length)
+    discard = start.index("removeBlocklistCandidateFiles")
     candidate = start.index("LittleFS.open(BLOCKLIST_NEW_PATH", discard)
-    assert authorize < header < decode < verify < discard < candidate
-    assert 'BLOCKLIST_PROOF_HEADER = "X-Blocklist-Proof"' in source
-    assert "BLOCKLIST_PROOF_HEADER" in source[source.index("REQUEST_HEADERS"):]
+    assert authorize < proof < verify < signed_length < start_upload
+    assert discard < candidate
+    assert "X-Blocklist-Proof" not in source
+    assert "multipart/form-data" not in source
 
 
 def test_upload_authenticates_complete_payload_before_promotion() -> None:
@@ -676,7 +676,9 @@ def test_upload_authenticates_complete_payload_before_promotion() -> None:
     authenticated = end.index("authenticateBlocklistWithStoredProof", stored_proof)
     ready = end.index("BlocklistUploadStatus::CANDIDATE_READY", authenticated)
     assert structural < stored_proof < authenticated < ready
-    assert done.index("requireAdminMutation()") < done.index("promoteBlocklistCandidate()")
+    assert done.index("requireAdminMutation()") < done.index(
+        "promoteBlocklistCandidate(uploadDeadlineReached)"
+    )
     assert 'message = "signed blocklist proof required"' in done
     assert 'message = "invalid signed blocklist"' in done
 
@@ -878,8 +880,8 @@ def test_p5_4_wifi_retry_and_rf_workaround_are_unchanged() -> None:
     source = read_main()
     connect = cpp_function(source, "connectWiFi")
 
-    assert source.count("WiFi.begin(ssid, pass)") == 1
-    assert source.count("WiFi.reconnect()") == 1
+    assert connect.count("WiFi.begin(ssid, pass)") == 1
+    assert connect.count("WiFi.reconnect()") == 1
     assert connect.count("applyC3RfWorkaround()") == 1
     assert "WIFI_ASSOCIATION_TIMEOUT_MS = 20000" in source
     assert "WIFI_RETRY_SETTLE_MS = 250" in source

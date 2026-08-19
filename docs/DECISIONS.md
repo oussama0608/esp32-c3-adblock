@@ -255,7 +255,7 @@
   no se añade HSTS a un servicio HTTP.
 - Logs y entrada: la raíz no autenticada redirige únicamente a la ruta fija
   `/login` después de validar `Host`. El build falla si Arduino core se compila
-  en nivel `VERBOSE`, ya que `WebServer` contiene trazas que pueden imprimir los
+  en nivel `VERBOSE`, ya que un servidor HTTP puede contener trazas que impriman los
   cuerpos POST con contraseñas Wi-Fi/admin; los valores tampoco se imprimen desde
   el firmware de aplicación.
 - Blocklist remota: proteger el acceso a `/upload`, `/fetchnow` y `/setupdate` no
@@ -348,9 +348,9 @@
   y revalidar el activo resultante. Un fallo conserva o intenta restaurar la
   última copia válida. El firmware no interpreta una lista que no haya superado
   las validaciones de formato y límites.
-- Protocolo HTTP: multipart es el único cuerpo admitido por `/upload`; un
-  dispatcher separa el callback multipart del callback raw compartido por
-  `WebServer` y devuelve 415 para raw/urlencoded sin abrir staging.
+- Protocolo HTTP: P6.2 sustituye el transporte anterior por
+  `application/octet-stream` con `[blocklist.sig raw de 128 bytes][blocklist.bin]`.
+  No se acepta proof en cabeceras, parámetros ni otro framing de upload.
 - Orden de arranque: montar LittleFS sin autoformato y ejecutar la recuperación
   antes de leer el resto del estado o iniciar STA, SoftAP, mDNS, UDP/53 o el
   servidor HTTP. El montaje o recovery fallidos detienen el arranque sin reboot
@@ -370,13 +370,12 @@
   limpiar old, el nuevo activo gana y elimina el rollback residual. Estas
   propiedades necesitan HIL específico porque los tests host no prueban la
   durabilidad real de rename/remove en LittleFS.
-- Multipart y concurrencia: el tamaño de fichero se limita por cada chunk a
-  524.285 B. Como filtro temprano, el `Content-Length` del request completo admite
-  4.096 B adicionales de framing (528.381 B en total); un framing o filename
-  excepcionalmente grande puede recibir un 413 conservador. `WebServer` procesa
-  el multipart de forma síncrona. Los guards de parte adicional/transacción
-  huérfana son gates host-estáticos y no prueban desconexión, timeout, cliente
-  lento, recuperación del loop/DNS ni rate limiting en placa.
+- Envelope y concurrencia: `blocklist.bin` se limita a 524.285 B y el request
+  completo a 524.413 B, incluidos los 128 bytes de firma. La longitud firmada
+  debe coincidir exactamente con los bytes restantes antes de staging. El reader
+  bounded procesa el cuerpo en streaming y aborta ante límite, desconexión o
+  timeout; HIL todavía debe cubrir cliente lento, framing HTTP crudo,
+  recuperación del loop/DNS y rate limiting en placa.
 - Migración: `/update.cfg` deja de ser configuración activa y desaparece del
   código de producción. Si una unidad conserva ese archivo legacy, queda inerte:
   no se abre, interpreta ni usa para habilitar de nuevo el fetch remoto. Puede
@@ -400,7 +399,7 @@
   warnings del build indican que, sin Internet, se omitió la comprobación remota
   de dependencias. `ci_checks repository`, los diff checks y el gate de archivos
   protegidos pasan localmente. Permanecen pendientes CI real confirmada,
-  multipart en WebServer real, upload/browser HIL y cortes controlados en las
+  envelope binario real, upload/browser HIL y cortes controlados en las
   seis fronteras; P5.3a no está `CLOSED`.
 
 ## ADR-007 — P5.4 reintento STA acotado antes del portal
@@ -475,13 +474,15 @@
 - Protocolo: `blocklist.bin` conserva sin cambios sus registros little-endian de
   cinco bytes. `blocklist.sig` tiene exactamente 128 bytes: manifest fijo de 64
   bytes y firma raw `r || s` de 64 bytes. Se firma el SHA-256 de los 16 bytes
-  ASCII `NSM-BLOCKLIST-V1` concatenados con el manifest. La UI convierte el proof
-  a 256 caracteres hex en `X-Blocklist-Proof`; el binario sigue siendo la única
-  parte multipart.
+  ASCII `NSM-BLOCKLIST-V1` concatenados con el manifest. P6.2 transporta los
+  128 bytes raw de `blocklist.sig` como prefijo fijo de un cuerpo
+  `application/octet-stream`, seguido exactamente por `blocklist.bin`; no se
+  acepta proof fuera de ese envelope binario fijo.
 - Gate antes de escribir: Host, sesión y CSRF se validan primero. Después se
-  decodifica estrictamente el header, se comprueban magic/versiones/algoritmo,
-  flags, IDs, secuencia, longitud y recuento, y se verifica ECDSA. Un fallo termina
-  antes de abrir `/blocklist.new`. Tras recibirlo se valida el blob y se compara
+  leen exactamente 128 bytes, se comprueban magic/versiones/algoritmo, flags,
+  IDs, secuencia, longitud y recuento, y se verifica ECDSA. La longitud firmada
+  debe coincidir exactamente con el resto del cuerpo antes de abrir
+  `/blocklist.new`. Tras recibirlo se valida el blob y se compara
   el SHA-256 de los bytes persistidos con el manifest.
 - Staging: durante la transacción solo existen `/blocklist.new` y
   `/blocklist.new.auth`. Todo descarte elimina primero el proof y después el
@@ -518,7 +519,7 @@
   enlazado. `firmware.bin` mide 1.165.808 B, deja 210.448 B físicos y su SHA-256
   es `67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
   Frente a P5.4 aumenta 144 B RAM, 4.088 B enlazados y 4.448 B físicos. Esto no
-  sustituye CI real ni HIL multipart/power-cut.
+   sustituye CI real ni HIL de envelope binario/power-cut.
 
 ## ADR-009 — P6.1 parser DNS acotado y correlación upstream síncrona
 
@@ -584,3 +585,28 @@
   `EE75C250AE7BA1D922FF6F448AB2A360E62872E34F044EB2951625544C565BB8`.
   Frente a P5.5 son +592 B RAM, +2.514 B enlazados y +2.912 B físicos. El job
   Linux ASan/UBSan está definido, pero no se afirma ejecutado hasta GitHub.
+
+## ADR-010 — P6.2 envelope firmado y presupuesto de administración
+
+- Fecha: 2026-08-19.
+- Estado: accepted para validación local; framing HTTP crudo HIL confirmado; CI real pendiente.
+- Decisión: `POST /upload` acepta únicamente `application/octet-stream` con
+  `blocklist.sig` raw de 128 bytes como prefijo y el `blocklist.bin` firmado como
+  resto exacto. La firma autenticada vincula la longitud antes de abrir staging;
+  no se usan proof en cabeceras ni multipart.
+- Presupuesto: la ventana deja de aceptar trabajo nuevo a los 300 s. Un upload
+  aceptado puede finalizar solo hasta `min(upload+30 s, ventana+330 s)`. El único
+  cupo de promoción se registra exclusivamente después de una promoción
+  transaccional exitosa; timeout, error, autorización caducada y rollback no lo
+  consumen.
+- Recuperación: restos `.new.auth` y `.new` se limpian proof-first desde recovery
+  de arranque, tras clasificar active/old/candidate, y nunca sustituyen ni borran
+  el active válido.
+- Consecuencias: se conserva el formato binario de producción y el last-known-good.
+  HIL comprobó que el parser rechaza antes del handler `Content-Length` duplicado
+  igual o conflictivo, combinaciones `Content-Length`+`Transfer-Encoding` y los
+  dos órdenes de `Transfer-Encoding` duplicado. `Transfer-Encoding: chunked`
+  aislado llega al handler con `content_len=0`; por tanto `/upload` rechaza
+  deliberadamente cualquier `Transfer-Encoding` visible antes de reservar un
+  upload, leer el envelope o abrir staging. No se atribuye al parser el rechazo
+  del caso TE-only: es un control explícito de la aplicación.

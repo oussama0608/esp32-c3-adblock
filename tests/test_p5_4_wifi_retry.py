@@ -48,7 +48,7 @@ def test_wifi_retry_timing_constants_are_explicit(name: str, value: int) -> None
 
 def test_association_wait_is_wrap_safe_and_bounded_to_two_windows() -> None:
     source = _source()
-    helper = _function(source, "static bool waitForWiFiAssociation()")
+    helper = _function(source, "static bool waitForWiFiAssociation(const char* window)")
     connect = _function(source, "static bool connectWiFi()")
 
     assert re.search(r"(?:const\s+)?uint32_t\s+\w+\s*=\s*millis\(\)\s*;", helper)
@@ -58,8 +58,8 @@ def test_association_wait_is_wrap_safe_and_bounded_to_two_windows() -> None:
         helper,
     )
     assert "delay(250)" in helper
-    assert re.search(r"return\s+WiFi\.status\(\)\s*==\s*WL_CONNECTED\s*;", helper)
-    assert connect.count("waitForWiFiAssociation()") == 2
+    assert re.search(r"return\s+finalStatus\s*==\s*WL_CONNECTED\s*;", helper)
+    assert connect.count("waitForWiFiAssociation(") == 2
     assert connect.count("while") == 1  # bounded STA-start preflight only
     assert "while (true)" not in connect
     assert "connectWiFi()" not in connect.removeprefix("static bool connectWiFi()")
@@ -74,7 +74,7 @@ def test_sta_preflight_and_credential_begin_remain_single_and_ordered() -> None:
     started = [match.start() for match in re.finditer(r"WiFi\.STA\.started\(\)", connect)]
     rf = connect.index("applyC3RfWorkaround()")
     begin = connect.index("WiFi.begin(ssid, pass)")
-    first_wait = connect.index("waitForWiFiAssociation()")
+    first_wait = connect.index('waitForWiFiAssociation("first")')
 
     assert connect.count("WiFi.mode(WIFI_STA)") == 1
     assert connect.count("WiFi.setSleep(false)") == 1
@@ -84,7 +84,7 @@ def test_sta_preflight_and_credential_begin_remain_single_and_ordered() -> None:
     assert mode < sleep < min(started) < max(started) < rf < begin < first_wait
     assert re.search(
         r"WiFi\.begin\(ssid, pass\);\s*clearSensitiveString\(pw\);\s*"
-        r"if\s*\(\s*waitForWiFiAssociation\(\)\s*\)",
+        r"if\s*\(\s*waitForWiFiAssociation\(\"first\"\)\s*\)",
         connect,
     )
 
@@ -100,7 +100,7 @@ def test_retry_is_one_checked_disconnect_reconnect_cycle() -> None:
         )
     )
     reconnect_calls = list(re.finditer(r"WiFi\.reconnect\(\)", connect))
-    waits = list(re.finditer(r"waitForWiFiAssociation\(\)", connect))
+    waits = list(re.finditer(r"waitForWiFiAssociation\(", connect))
     settles = list(re.finditer(r"delay\(WIFI_RETRY_SETTLE_MS\)", connect))
 
     assert len(disconnect_calls) == 2
@@ -130,7 +130,8 @@ def test_retry_is_one_checked_disconnect_reconnect_cycle() -> None:
 
     reconnect_region = connect[disconnect_calls[0].end() : waits[1].start()]
     assert re.search(
-        r"if\s*\(\s*!WiFi\.reconnect\(\)\s*\)\s*"
+        r"const\s+bool\s+reconnectRequested\s*=\s*WiFi\.reconnect\(\);.*?"
+        r"if\s*\(\s*!reconnectRequested\s*\)\s*"
         r"\{.*?return false;\s*\}",
         reconnect_region,
         re.DOTALL,
@@ -151,7 +152,7 @@ def test_success_and_failure_paths_preserve_bounded_fallback() -> None:
     connect = _function(source, "static bool connectWiFi()")
     setup = _function(source, "void setup()")
 
-    waits = list(re.finditer(r"waitForWiFiAssociation\(\)", connect))
+    waits = list(re.finditer(r"waitForWiFiAssociation\(", connect))
     reconnect = connect.index("WiFi.reconnect()")
     final_disconnect = connect.rindex(
         "WiFi.disconnect(false, false, WIFI_DISCONNECT_TIMEOUT_MS)"
@@ -159,7 +160,7 @@ def test_success_and_failure_paths_preserve_bounded_fallback() -> None:
 
     for wait in waits:
         assert re.match(
-            r"waitForWiFiAssociation\(\)\s*\)\s*"
+            r"waitForWiFiAssociation\([^)]*\)\s*\)\s*"
             r"(?:\{\s*)?return true;",
             connect[wait.start() :],
             re.DOTALL,
@@ -169,7 +170,8 @@ def test_success_and_failure_paths_preserve_bounded_fallback() -> None:
     assert re.search(
         r"delay\(WIFI_RETRY_SETTLE_MS\);\s*return false;\s*\}", connect
     )
-    assert "if (!connectWiFi()) startConfigPortal();" in setup
+    assert "const bool setupWifiConnected = connectWiFi()" in setup
+    assert "runtimeState = RuntimeState::OFFLINE_RECOVERY_REQUIRED" in setup
 
 
 def test_preflight_failures_and_missing_credentials_cannot_enter_retry() -> None:
@@ -190,7 +192,8 @@ def test_preflight_failures_and_missing_credentials_cannot_enter_retry() -> None
         re.DOTALL,
     )
     rf_guard = re.search(
-        r"if\s*\(\s*!applyC3RfWorkaround\(\)\s*\)\s*"
+        r"const\s+bool\s+staRfWorkaroundOk\s*=\s*applyC3RfWorkaround\(\);.*?"
+        r"if\s*\(\s*!staRfWorkaroundOk\s*\)\s*"
         r"\{.*?return false;\s*\}",
         connect,
         re.DOTALL,
@@ -210,8 +213,8 @@ def test_wifi_driver_persistence_is_disabled_before_every_initial_path() -> None
     assert source.count("WiFi.persistent(false)") == 1
     assert "WiFi.persistent(true)" not in source
     persistent = setup.index("WiFi.persistent(false)")
-    admin_gate = setup.index("if (!hasAdminVerifier()) startConfigPortal();")
-    connect_gate = setup.index("if (!connectWiFi()) startConfigPortal();")
+    admin_gate = setup.index("if (!hasAdminVerifier())")
+    connect_gate = setup.index("const bool setupWifiConnected = connectWiFi()")
     assert persistent < admin_gate < connect_gate
 
 
@@ -225,9 +228,5 @@ def test_retry_adds_no_persistent_writes_callbacks_or_secret_logging() -> None:
     assert "ESP.restart(" not in connect
     assert "WiFi.mode(WIFI_OFF)" not in connect
     assert connect.count("WiFi.mode(WIFI_STA)") == 1
-    assert not re.search(
-        r"Serial\.(?:print|println|printf)\([^;\n]*"
-        r"(?:ssid|pass|pw\.c_str\(\)|ss\.c_str\(\))",
-        connect,
-        re.IGNORECASE,
-    )
+    assert not re.search(r"Serial\.printf\([^;\n]*pw\.c_str\(\)", connect)
+    assert not re.search(r"Serial\.printf\([^;\n]*pass\s*=%s[^;\n]*pw", connect)

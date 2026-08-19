@@ -92,7 +92,7 @@ comprueban:
 - headers `no-store`, `nosniff`, `no-referrer` y CSP compatible con el dashboard;
 - redirect fijo de la raíz no autenticada a `/login` después de validar `Host`,
   y error de compilación si el core se configura en nivel `VERBOSE`, porque
-  `WebServer` podría registrar cuerpos de formularios sensibles;
+  el servidor HTTP podría registrar cuerpos de formularios sensibles;
 - regresiones de P5.1: `/update`/ArduinoOTA/Update ausentes, un único
   `WiFi.begin`, workaround RF a 8,5 dBm y archivos protegidos intactos.
 
@@ -171,8 +171,9 @@ Los gates automatizados de esta entrega deben cubrir:
 - autorización antes de abrir el candidato, límite por cada chunk, comprobación
   de cada write, abort/short write/overflow sin tocar el activo, respuesta 413
   por exceso y rechazo 409 de una transacción reentrante;
-- dispatcher por `Content-Type`: multipart es el único upload aceptado; cuerpos
-  raw/urlencoded se rechazan con 415 sin acceder a `web.upload()` ni crear candidato;
+- dispatcher por `Content-Type`: `/upload` acepta exclusivamente
+  `application/octet-stream` con `[blocklist.sig raw de 128 bytes][blocklist.bin]`;
+  otros cuerpos se rechazan con 415 sin crear candidato;
 - recuperación determinista al arrancar: un activo válido gana y limpia restos;
   sin activo válido se restaura un rollback válido; sin ambos se promueve un
   candidato válido; si no existe ninguna copia válida se falla cerrado;
@@ -210,15 +211,14 @@ red: exige restaurar por USB una imagen LittleFS conocida y validada, con
 aprobación humana separada. Tampoco se considera resuelta la autenticidad de una
 lista subida manualmente ni la confidencialidad del panel HTTP.
 
-El gate temprano de `Content-Length` se aplica al cuerpo multipart completo con
-4.096 bytes de margen sobre el máximo de archivo, mientras el límite por chunks
-de 524.285 bytes es el control definitivo. Un filename o framing multipart
-inusualmente grande puede producir un 413 conservador aun con un archivo de
-tamaño válido. Además, `WebServer` procesa multipart de forma síncrona: los
-guards de partes adicionales y la limpieza de una transacción huérfana son
-invariantes estáticos/modelados, no una prueba HTTP real. Quedan pendientes un
-cliente lento, desconexión a mitad de body, multipart sin fichero/con varias
-partes, timeout del core, recuperación del loop/DNS y rate limiting general.
+El gate temprano exige un `Content-Length` estricto e igual al tamaño que
+`esp_http_server` ya ha parseado. El total máximo es 524.413 bytes: los 128 de
+`blocklist.sig` más 524.285 bytes de `blocklist.bin`. La longitud firmada debe
+coincidir exactamente con el resto del cuerpo antes de abrir staging. El reader
+streaming tiene buffer de 512 bytes, límite absoluto de 30 segundos y no acepta
+bytes de cuerpo fuera de esa longitud autenticada. Quedan pendientes HIL de
+cliente lento, desconexión a mitad de body, matriz de framing HTTP crudo,
+recuperación del loop/DNS y rate limiting general.
 
 La validación local integrada de P5.3a terminó con **163 passed** y Ruff sin
 errores. PlatformIO terminó `SUCCESS`: RAM estática 50.684/327.680 B (15,5 %),
@@ -291,11 +291,12 @@ no acredita hardware ni autoriza PILOT.
 ## P5.5 — procedencia firmada de blocklists manuales
 
 P5.5 mantiene intacto el formato activo de registros de cinco bytes y exige para
-cada nuevo upload HTTP una prueba separada de 128 bytes. El navegador envía solo
-`blocklist.bin` como parte multipart y codifica `blocklist.sig` como 256 dígitos
-hexadecimales en `X-Blocklist-Proof`. El firmware valida el envelope y ECDSA
-P-256/SHA-256 antes de abrir `/blocklist.new`, y vuelve a comprobar tamaño,
-recuento y SHA-256 contra los bytes persistidos antes y después de promocionarlos.
+cada nuevo upload HTTP una prueba de 128 bytes. En P6.2 el navegador envía un
+cuerpo `application/octet-stream` fijo: `blocklist.sig` raw (bytes 0..127)
+seguido de `blocklist.bin`. El firmware valida el envelope y ECDSA P-256/SHA-256
+antes de abrir `/blocklist.new`, exige que el resto del cuerpo tenga exactamente
+la longitud firmada y vuelve a comprobar tamaño, recuento y SHA-256 contra los
+bytes persistidos antes y después de promocionarlos.
 
 Los tests permanentes de esta entrega cubren:
 
@@ -313,8 +314,9 @@ Los tests permanentes de esta entrega cubren:
 - modelo de cada frontera de corte: escritura del candidato, persistencia del
   proof, `active -> old`, `new -> active`, revalidación, retirada del proof y
   retirada final del rollback;
-- UI de dos ficheros, tamaño exacto de firma y header hexadecimal; guards
-  Host/sesión/CSRF y POST anteriores permanecen obligatorios;
+- UI de dos ficheros, firma exacta de 128 bytes y envelope binario fijo
+  `[blocklist.sig][blocklist.bin]`; guards Host/sesión/CSRF y POST anteriores
+  permanecen obligatorios;
 - signer genérico: validación del blob, manifest de 64 bytes, digest de
   protocolo, P-256, `r || s` fijo con low-S y sustitución atómica;
 - ausencia de clave privada, fetch remoto y OTA, además de todas las regresiones
@@ -328,8 +330,8 @@ tabla de confianza del firmware. La procedencia y el SHA-256 del paquete NIST se
 registran junto a las fixtures. Ningún test firma con la clave de producción.
 
 La cobertura host modela la secuencia de filesystem, pero no demuestra la
-durabilidad ni atomicidad real de LittleFS. Quedan pendientes HIL del multipart
-real y cortes controlados en cada frontera. V1 acepta deliberadamente replay de
+durabilidad ni atomicidad real de LittleFS. Quedan pendientes HIL del envelope
+binario real, framing HTTP crudo y cortes controlados en cada frontera. V1 acepta deliberadamente replay de
 una release correctamente firmada y conserva compatibilidad de boot con listas
 legacy unsigned; tampoco guarda un proof activo permanente, por lo que aporta
 procedencia de ingreso, no attestation continua en reposo.
@@ -342,6 +344,29 @@ PlatformIO termina `SUCCESS`: 50.828/327.680 B de RAM (15,5 %),
 SHA-256 `67DFDE5BE7A11D608B624AA3C8E1DD56896696986B0CD8EB1BF6A0DE699814B7`.
 Frente a P5.4 son +144 B RAM, +4.088 B enlazados y +4.448 B físicos. La CI real
 y todo HIL P5.5 siguen pendientes.
+
+## P6.2 — envelope binario y límites de transacción
+
+Los gates permanentes cubren el cuerpo `application/octet-stream` con proof raw
+de 128 bytes seguido por el payload firmado, sin multipart ni proof en cabecera.
+El harness nativo `test_fixed_envelope.cpp` prueba fragmentación de cada posición
+del prefijo, prefetch sobre la frontera proof/payload, truncado, EOF, timeout,
+error de receive, trailing byte y límites exactos de 524.285 B. El harness
+`test_admin_state.cpp` prueba los límites de ventana: no hay trabajo nuevo desde
+300.000 ms, un upload aceptado puede continuar hasta `min(upload+30 s, ventana+330 s)`,
+y una promoción fallida no consume su único cupo exitoso.
+
+La recuperación llama la limpieza proof-first de `.new.auth` y después `.new`
+solo tras clasificar active/old/candidate; no borra el active. El HIL de framing
+HTTP crudo confirmó: `Content-Length` duplicado igual o conflictivo se rechaza
+antes del handler; `Content-Length`+`Transfer-Encoding` (ambos órdenes) y
+`Transfer-Encoding` duplicado probado se reinician/rechazan antes del handler;
+`Transfer-Encoding: chunked` aislado llega al handler con `content_len=0` y valor
+visible `chunked`. Por diseño, `/upload` rechaza cualquier `Transfer-Encoding`
+visible antes de leer el envelope o abrir staging. Los bytes posteriores a un
+`Content-Length` no pasan a ser el cuerpo de la petición actual y un cuerpo
+ordinario fragmentado se recibe completo. Siguen pendientes HIL de
+LittleFS/power-loss, cliente lento y disponibilidad DNS.
 
 ## P6.1 — parser DNS acotado y correlación upstream
 
@@ -522,7 +547,7 @@ acreditan P6.1 ni sustituye su ejecución en GitHub.
 Una persona confirmó el HIL completo solicitado de P5.2/P5.2a sobre `bbeacda`,
 incluidos auth/sesión/CSRF/Host/XSS, portal físico BOOT y recuperación runtime.
 Esa confirmación no incluye P5.3a. Para P5.3a quedan pendientes upload manual
-real, respuestas HTTP, multipart/abort/desconexión, presión de espacio y los seis
+real, respuestas HTTP, envelope binario/abort/desconexión, presión de espacio y los seis
 cortes de alimentación de la matriz anterior. También siguen pendientes:
 
 - 24 horas y 7 días;

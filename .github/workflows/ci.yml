@@ -92,6 +92,48 @@ jobs:
           --iterations 1000000
           --seed 0x4E534D
 
+      - name: Build fixed upload-envelope reader with ASan and UBSan
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc tests/native/test_fixed_envelope.cpp \
+            -o .native-build/fixed_envelope_tests
+
+      - name: Run fixed upload-envelope reader tests
+        env:
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: ./.native-build/fixed_envelope_tests
+
+      - name: Build admin deadline and quota state with ASan and UBSan
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc src/admin_state.cpp tests/native/test_admin_state.cpp \
+            -o .native-build/admin_state_tests
+
+      - name: Run admin deadline and quota state tests
+        env:
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: ./.native-build/admin_state_tests
+
+      - name: Build admin HTTP policy with ASan and UBSan
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc src/admin_state.cpp tests/native/test_admin_http_policy.cpp \
+            -o .native-build/admin_http_policy_tests
+
+      - name: Run admin HTTP policy tests
+        env:
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: ./.native-build/admin_http_policy_tests
+
   firmware-build:
     name: Firmware build
     runs-on: windows-2022
