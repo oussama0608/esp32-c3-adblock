@@ -465,8 +465,8 @@
 ## ADR-008 — P5.5 procedencia firmada para upload manual de blocklist
 
 - Fecha: 2026-08-09.
-- Estado: accepted; implementación y validación host/build locales completadas,
-  CI y HIL pendientes.
+- Estado: superseded únicamente en su trust anchor por ADR-011; el protocolo y
+  la arquitectura de procedencia permanecen vigentes.
 - Decisión criptográfica: cada nuevo upload manual exige ECDSA P-256 con
   SHA-256. La tabla read-only del firmware contiene exactamente la clave pública
   SEC1 aprobada, Key ID `2173599637`, y solo acepta List ID `1`. La clave privada
@@ -610,3 +610,39 @@
   deliberadamente cualquier `Transfer-Encoding` visible antes de reservar un
   upload, leer el envelope o abrir staging. No se atribuye al parser el rechazo
   del caso TE-only: es un control explícito de la aplicación.
+
+## ADR-011 — P7 rotación del trust anchor de blocklists
+
+- Fecha: 2026-08-21.
+- Estado: accepted; validación local, build y smoke HIL completados; CI real
+  pendiente de confirmar tras el push.
+- Motivo: la clave privada original permanece cifrada y conservada fuera del
+  repositorio, pero su passphrase no pudo recuperarse sin fuerza bruta. Se rota
+  únicamente la autoridad de firma de blocklists; no cambian credenciales de
+  administración o Wi-Fi, NVS, particiones, firmware OTA ni eFuses.
+- Decisión: confiar en una única nueva clave pública P-256 SEC1 de 65 bytes,
+  Key ID `2008216462`, derivado como
+  `uint32_le(SHA256(sec1_public_key)[0:4])`. El fingerprint SHA-256 del punto
+  SEC1 es
+  `8EF3B27735E85B03F35009F481BF390D5EB1658FDB2D46A524B539858C8BB3BC`.
+  List ID permanece `1`.
+- Custodia: la clave privada v2 se genera criptográficamente fuera del
+  repositorio como PKCS#8 cifrado con PBES2/PBKDF2-HMAC-SHA256/AES-256-CBC. Su
+  passphrase se guarda en un fichero separado con ACL restringida. Ni la clave
+  privada ni la passphrase entran en firmware, Git, tests o CI.
+- Compatibilidad: no se habilita doble confianza. Las firmas del Key ID retirado
+  `2173599637` dejan de ser aceptadas tras instalar el firmware P7; la lista
+  activa ya instalada y los ficheros active/old legacy siguen siendo
+  boot-compatibles porque no cambia el formato de datos.
+- Protocolo: se preservan ECDSA P-256/SHA-256, el dominio
+  `NSM-BLOCKLIST-V1`, el manifest de 64 bytes, la firma raw low-S `r || s`, el
+  proof total de 128 bytes y el envelope fijo de P6.2. No se habilita fetch
+  remoto ni se añade una clave privada al dispositivo.
+- Validación P7: 268 tests pytest, Ruff, gates de repositorio/workflow y los
+  cuatro harnesses MSVC `/W4 /WX /ASan` pasan; DNS completa 1.000.000 de
+  mutaciones. PlatformIO termina `SUCCESS`: RAM 52.620 B, flash enlazada
+  1.093.379 B, `firmware.bin` 1.125.952 B, margen físico 250.304 B y SHA-256
+  `D41D0C30269ADBAF4C041C88C0F27F2E08264DBE54EBC56B79ACD0FAFF918438`.
+  El flash app-only verifica el hash de escritura; después del reinicio pasan
+  ping, DNS permitido, bloqueo a `0.0.0.0` y ausencia de listener TCP/80 en
+  modo normal.

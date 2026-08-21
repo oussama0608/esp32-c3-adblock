@@ -301,8 +301,11 @@ bytes persistidos antes y después de promocionarlos.
 Los tests permanentes de esta entrega cubren:
 
 - layout exacto del manifest/proof, dominio firmado, little-endian y tabla de
-  confianza con una única clave pública de producción, Key ID `2173599637` y
+  confianza con una única clave pública de producción, Key ID `2008216462` y
   List ID `1`;
+- derivación del Key ID desde los primeros cuatro bytes del SHA-256 del punto
+  SEC1, rechazo explícito del Key ID y punto SEC1 retirados y compatibilidad
+  negativa entre los anchors anterior y nuevo;
 - firma válida y rechazos por firma o payload alterados, proof truncado/hex
   malformado, clave desconocida, list ID, versión, algoritmo, flags, secuencia
   cero, longitud, count, SHA y valores `r`/`s` inválidos;

@@ -160,8 +160,12 @@ autoriza flash ni piloto.
 ## Diseño de la candidate P5.5
 
 - El firmware confía en una sola clave pública P-256 aprobada, con Key ID
-  `2173599637`, y acepta exclusivamente List ID `1`. La clave privada de
+  `2008216462`, y acepta exclusivamente List ID `1`. La clave privada de
   producción no existe en firmware, repositorio, tests ni CI.
+- P7 sustituyó el trust anchor anterior de Key ID `2173599637` porque su
+  passphrase dejó de estar disponible. La rotación conserva el protocolo, pero
+  las firmas emitidas por la clave retirada son intencionadamente inválidas para
+  este firmware; las blocklists activas legacy siguen siendo compatibles al boot.
 - La blocklist activa no cambia de formato. El proof separado tiene 128 bytes y
   firma con ECDSA P-256/SHA-256 el manifest que contiene secuencia no nula,
   longitud, recuento y SHA-256 del payload. La UI exige ambos ficheros y envía

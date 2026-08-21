@@ -270,9 +270,14 @@ condiciones completas.
 
 P5.5 conserva el formato activo y la ausencia de fetch remoto. Cada nuevo
 `POST /upload` requiere un proof de 128 bytes firmado con ECDSA P-256/SHA-256
-por la única clave pública autorizada (Key ID `2173599637`, List ID `1`). Host,
+por la única clave pública autorizada (Key ID `2008216462`, List ID `1`). Host,
 sesión y CSRF se comprueban antes del proof; un proof ausente, malformado o no
 autorizado falla antes de crear `/blocklist.new`.
+
+P7 rotó la única clave autorizada desde Key ID `2173599637`. No existe ventana
+de doble confianza: un proof firmado por la clave retirada falla como clave
+desconocida, mientras el formato de `blocklist.bin` y la compatibilidad de boot
+con active/old legacy permanecen sin cambios.
 
 El manifest autentica secuencia no nula, tamaño, recuento y SHA-256 del payload.
 El firmware comprueba la firma al iniciar el upload, después valida los bytes

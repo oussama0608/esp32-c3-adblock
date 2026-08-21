@@ -240,6 +240,7 @@ def _sign_manifest(
     executable: Path,
     private_key: Path,
     manifest: bytes,
+    passphrase_file: Path | None,
 ) -> bytes:
     message_path: Path | None = None
     try:
@@ -252,10 +253,11 @@ def _sign_manifest(
             message_file.flush()
             os.fsync(message_file.fileno())
 
-        der_signature = _run_openssl(
-            executable,
-            ["dgst", "-sha256", "-sign", str(private_key), str(message_path)],
-        )
+        arguments = ["dgst", "-sha256", "-sign", str(private_key)]
+        if passphrase_file is not None:
+            arguments.extend(["-passin", f"file:{passphrase_file}"])
+        arguments.append(str(message_path))
+        der_signature = _run_openssl(executable, arguments)
         return _der_signature_to_raw(der_signature)
     finally:
         if message_path is not None:
@@ -273,16 +275,22 @@ def sign_blocklist(
     list_id: int,
     sequence: int,
     openssl: str | Path | None = None,
+    passphrase_file_path: str | Path | None = None,
 ) -> SignResult:
     """Validate, sign, and atomically install a fixed 128-byte proof."""
     input_file = Path(input_path)
     output_file = Path(output_path)
     private_key = Path(private_key_path)
+    passphrase_file = (
+        Path(passphrase_file_path) if passphrase_file_path is not None else None
+    )
 
     if _same_path(input_file, output_file):
         raise SignerError("proof output must not overwrite the input blocklist")
     if _same_path(private_key, output_file):
         raise SignerError("proof output must not overwrite the private key")
+    if passphrase_file is not None and _same_path(passphrase_file, output_file):
+        raise SignerError("proof output must not overwrite the passphrase file")
     if not 1 <= list_id <= UINT32_MAX:
         raise SignerError("list ID is outside the uint32 range")
     if not 1 <= sequence <= UINT64_MAX:
@@ -292,10 +300,11 @@ def sign_blocklist(
     validate_blob(payload, DEFAULT_MAX_OUTPUT_BYTES)
 
     executable = Path(openssl) if openssl is not None else _find_openssl()
-    public_key_der = _run_openssl(
-        executable,
-        ["pkey", "-in", str(private_key), "-pubout", "-outform", "DER"],
-    )
+    public_key_arguments = ["pkey", "-in", str(private_key)]
+    if passphrase_file is not None:
+        public_key_arguments.extend(["-passin", f"file:{passphrase_file}"])
+    public_key_arguments.extend(["-pubout", "-outform", "DER"])
+    public_key_der = _run_openssl(executable, public_key_arguments)
     public_key = _extract_p256_public_key(public_key_der)
     key_id = int.from_bytes(hashlib.sha256(public_key).digest()[:4], "little")
 
@@ -305,7 +314,9 @@ def sign_blocklist(
         list_id=list_id,
         sequence=sequence,
     )
-    proof = manifest + _sign_manifest(executable, private_key, manifest)
+    proof = manifest + _sign_manifest(
+        executable, private_key, manifest, passphrase_file
+    )
     if len(proof) != PROOF_SIZE:
         raise SignerError("internal proof size mismatch")
     atomic_write(output_file, proof)
@@ -326,6 +337,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-id", required=True, type=_uint32)
     parser.add_argument("--sequence", required=True, type=_uint64)
     parser.add_argument("--private-key", required=True, type=Path)
+    parser.add_argument("--passphrase-file", type=Path)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     return parser
@@ -341,6 +353,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.private_key,
             list_id=arguments.list_id,
             sequence=arguments.sequence,
+            passphrase_file_path=arguments.passphrase_file,
         )
     except (BlocklistError, OSError, SignerError) as error:
         print(f"error: {error}", file=sys.stderr)

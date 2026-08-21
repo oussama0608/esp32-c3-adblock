@@ -28,9 +28,14 @@ MANIFEST = struct.Struct("<4sBBBBIIQII32s")
 DOMAIN = b"NSM-BLOCKLIST-V1"
 MAX_RECORDS = 104_857
 MAX_BYTES = MAX_RECORDS * 5
-PRODUCTION_KEY_ID = 2_173_599_637
+PRODUCTION_KEY_ID = 2_008_216_462
 PRODUCTION_LIST_ID = 1
 PRODUCTION_PUBLIC_KEY = bytes.fromhex(
+    "04390470C844A8E725D79CF2393AE871C00B4AE56815EB86A6F03B73052CEB74366"
+    "BD2DF611228B5B563E5A27F90D7FE77CD4B661B03BC4CCEC3B0C698704A8259"
+)
+RETIRED_PRODUCTION_KEY_ID = 2_173_599_637
+RETIRED_PRODUCTION_PUBLIC_KEY = bytes.fromhex(
     "04C642B500A5378CD0A4FDD3FC1028FBF3E3E908BD7F7A855485C97473050571762"
     "EAED935008E0A4F32EB0FA66B51D43E3F8F849FFA3299355A32C39433BEC765"
 )
@@ -539,6 +544,46 @@ def test_signer_writes_exact_public_fixture_proof_atomically(
     assert [call[0] for call in calls] == ["pkey", "dgst"]
 
 
+def test_signer_passphrase_file_is_forwarded_without_reading_or_logging_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vector = load_fixture("netshield_protocol_test_vector.json")
+    payload = bytes.fromhex(str(vector["payload_hex"]))
+    public_key = bytes.fromhex(str(vector["public_key_sec1_hex"]))
+    raw_signature = bytes.fromhex(str(vector["proof_hex"]))[64:]
+    input_path = tmp_path / "blocklist.bin"
+    output_path = tmp_path / "blocklist.sig"
+    key_reference = tmp_path / "offline-key-reference"
+    passphrase_reference = tmp_path / "offline-passphrase-reference"
+    input_path.write_bytes(payload)
+    calls: list[list[str]] = []
+
+    def fake_openssl(executable: Path, arguments: list[str]) -> bytes:
+        del executable
+        calls.append(arguments)
+        if arguments[0] == "pkey":
+            return sign_blocklist.P256_SPKI_PREFIX + public_key
+        return raw_signature_to_der(raw_signature)
+
+    monkeypatch.setattr(sign_blocklist, "_run_openssl", fake_openssl)
+
+    sign_blocklist.sign_blocklist(
+        input_path,
+        output_path,
+        key_reference,
+        list_id=1,
+        sequence=42,
+        openssl=tmp_path / "mock-openssl",
+        passphrase_file_path=passphrase_reference,
+    )
+
+    expected = ["-passin", f"file:{passphrase_reference}"]
+    assert all(
+        any(call[index : index + 2] == expected for index in range(len(call) - 1))
+        for call in calls
+    )
+
+
 def test_signer_failure_preserves_previous_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -574,7 +619,14 @@ def test_signer_failure_preserves_previous_output(
 def test_signer_is_generic_atomic_and_contains_no_embedded_key() -> None:
     source = (REPO_ROOT / "tools" / "sign_blocklist.py").read_text(encoding="utf-8")
 
-    for option in ("--list-id", "--sequence", "--private-key", "--input", "--output"):
+    for option in (
+        "--list-id",
+        "--sequence",
+        "--private-key",
+        "--passphrase-file",
+        "--input",
+        "--output",
+    ):
         assert option in source
     assert "validate_blob(payload" in source
     assert "atomic_write(output_file, proof)" in source
@@ -587,12 +639,61 @@ def test_production_trust_table_contains_exactly_the_approved_public_key() -> No
     byte_stream = bytes(int(value, 16) for value in re.findall(r"0x([0-9A-Fa-f]{2})", source))
 
     assert "struct TrustedBlocklistKey" in source
-    assert "kBlocklistProductionKeyId = 2173599637u" in source
+    assert "kBlocklistProductionKeyId = 2008216462u" in source
     assert "kBlocklistAcceptedListId = 1u" in source
     assert byte_stream.count(PRODUCTION_PUBLIC_KEY) == 1
+    assert RETIRED_PRODUCTION_PUBLIC_KEY not in byte_stream
+    assert str(RETIRED_PRODUCTION_KEY_ID) not in source
     assert "kTrustedBlocklistKeyCount == 1" in source
     assert "trustedBlocklistKeyIdsAreUnique" in source
     assert "sec1PublicKey[0] == 0x04" in source
+
+
+def test_production_key_id_is_derived_from_exact_sec1_public_key() -> None:
+    digest = hashlib.sha256(PRODUCTION_PUBLIC_KEY).digest()
+
+    assert int.from_bytes(digest[:4], "little") == PRODUCTION_KEY_ID
+    assert digest.hex().upper() == (
+        "8EF3B27735E85B03F35009F481BF390D5EB1658FDB2D46A524B539858C8BB3BC"
+    )
+
+
+def test_new_firmware_rejects_proofs_claiming_retired_key_id() -> None:
+    payload = b"\x01\x02\x03\x04\x05"
+    manifest = sign_blocklist._build_manifest(
+        payload,
+        key_id=RETIRED_PRODUCTION_KEY_ID,
+        list_id=PRODUCTION_LIST_ID,
+        sequence=1,
+    )
+
+    assert (
+        authenticate(
+            payload,
+            manifest + bytes(64),
+            {PRODUCTION_KEY_ID: PRODUCTION_PUBLIC_KEY},
+        )
+        is ProofStatus.UNKNOWN_KEY
+    )
+
+
+def test_retired_firmware_anchor_rejects_proofs_claiming_new_key_id() -> None:
+    payload = b"\x01\x02\x03\x04\x05"
+    manifest = sign_blocklist._build_manifest(
+        payload,
+        key_id=PRODUCTION_KEY_ID,
+        list_id=PRODUCTION_LIST_ID,
+        sequence=1,
+    )
+
+    assert (
+        authenticate(
+            payload,
+            manifest + bytes(64),
+            {RETIRED_PRODUCTION_KEY_ID: RETIRED_PRODUCTION_PUBLIC_KEY},
+        )
+        is ProofStatus.UNKNOWN_KEY
+    )
 
 
 def test_disposable_test_key_is_not_firmware_trusted() -> None:

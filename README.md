@@ -82,7 +82,8 @@ python3 tools/build_blocklist.py data/blocklist.bin
 # 2b. release authority only: create the detached 128-byte proof
 #     (the approved private key stays offline and outside this repository)
 python3 tools/sign_blocklist.py --list-id 1 --sequence <nonzero-release-sequence> \
-  --private-key <approved-private-key-path> --input data/blocklist.bin \
+  --private-key <approved-private-key-path> \
+  --passphrase-file <approved-passphrase-file-path> --input data/blocklist.bin \
   --output data/blocklist.sig
 
 # 3. initial firmware + blocklist filesystem flash (requires hardware approval)
